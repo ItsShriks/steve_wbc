@@ -1,0 +1,15 @@
+# Target profile 'red' — recorded with target_calibrator
+name: red
+hsv_ranges:
+- - 1
+  - 155
+  - 39
+  - 14
+  - 255
+  - 255
+size: 0.05
+shape: sphere
+min_pixels: 30
+notes: recall 90%, background false positives 0.00% on 2 capture(s); 2026-09-27 22:12
+samples: 2
+extra: {}

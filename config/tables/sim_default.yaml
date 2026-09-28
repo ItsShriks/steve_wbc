@@ -1,0 +1,11 @@
+# The MuJoCo scene's table (models/mmo_700_wbc.xml): top 0.80 x 0.70 m at 0.80 m, closed skirt.
+name: sim_default
+frame: odom
+center: [2.0, 0.0]
+yaw: 0.0
+size: [0.8, 0.7]
+top_z: 0.8
+thickness: 0.05
+legs: [[0.35, 0.3, 0.025], [0.35, -0.3, 0.025], [-0.35, 0.3, 0.025], [-0.35, -0.3, 0.025]]
+skirt: 0.4
+notes: reference, same geometry as the MJCF table
