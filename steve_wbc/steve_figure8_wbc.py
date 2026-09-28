@@ -1080,6 +1080,7 @@ class RosBackend(Backend):
         self.q = None
         self.q_ros = None   # raw /joint_states (ROS convention)
         self.q_cmd = None   # integrated arm setpoint (ROS convention), trajectory interface
+        self.dq_f = None    # low-pass filtered arm velocity command (--arm_cmd_tau)
         self.q_stamp = 0.0
         self.arm_resolved = False
         self.arm_names = list(ARM_JOINTS)
@@ -1104,7 +1105,30 @@ class RosBackend(Backend):
         else:
             self.pub_arm = self.node.create_publisher(JointTrajectory, args.arm_traj_topic, 10)
 
+        # Velocity interface on the real robot: switch trajectory -> velocity controller on the
+        # first command (not in dry runs) and back on shutdown, so MoveIt / send_goal keep working
+        self.switch_cli = None
+        self.switched = False
+        if args.arm_interface == "velocity" and args.switch_controllers:
+            from controller_manager_msgs.srv import SwitchController
+            self.SwitchController = SwitchController
+            self.switch_cli = self.node.create_client(
+                SwitchController, f"{args.controller_manager}/switch_controller")
+
         self._t_next = None
+
+    def _switch(self, activate, deactivate):
+        """Synchronous controller switch (STRICT); True on success."""
+        if not self.switch_cli.wait_for_service(timeout_sec=3.0):
+            self.log.error("controller_manager/switch_controller not available")
+            return False
+        req = self.SwitchController.Request(activate_controllers=[activate],
+                                            deactivate_controllers=[deactivate], strictness=2)
+        fut = self.switch_cli.call_async(req)
+        self.rclpy.spin_until_future_complete(self.node, fut, timeout_sec=3.0)
+        ok = fut.done() and fut.result() is not None and fut.result().ok
+        self.log.info(f"controllers: {deactivate} -> {activate}: {'ok' if ok else 'FAILED'}")
+        return ok
 
     # Callbacks ─────────────────────────────────────────────────────────────
     def _js_cb(self, msg):
@@ -1159,14 +1183,33 @@ class RosBackend(Backend):
             return None
         return RobotState(self.base.copy(), self.q.copy())
 
-    def send(self, u):
+    def send(self, u, filtered=True):
         tw = self.Twist()
         tw.linear.x, tw.linear.y, tw.angular.z = float(u[0]), float(u[1]), float(u[2])
         self.pub_twist.publish(tw)
 
-        dq = u[3:]
+        dq = np.asarray(u[3:], float)
+        # First-order low-pass on the arm command: the QP re-solves on measured joint states
+        # every tick, so its output flips sign by ~1% at the control rate — heard as a buzz
+        # from the joints. Trajectory interface: only the streamed velocity and look-ahead
+        # are filtered; the position setpoint integrates the raw command, so the filter adds
+        # no lag to the tracking loop (filtering it all made fast figure-8s unstable).
+        # Off with --arm_cmd_tau 0; bypassed when stopping.
+        tau = self.args.arm_cmd_tau
+        if tau > 0 and filtered:
+            if self.dq_f is None:
+                self.dq_f = dq.copy()
+            self.dq_f += self.dt / (tau + self.dt) * (dq - self.dq_f)
+        else:
+            self.dq_f = dq.copy()
+        dq_s = self.dq_f.copy()
         if self.args.arm_interface == "velocity":
-            self.pub_arm.publish(self.Float64MultiArray(data=[float(v) for v in dq]))
+            if self.switch_cli is not None and not self.switched:
+                if not self._switch(self.args.arm_vel_controller, self.args.arm_traj_controller):
+                    raise RuntimeError(f"could not activate {self.args.arm_vel_controller} "
+                                       "(loaded? ros2 control list_controllers)")
+                self.switched = True
+            self.pub_arm.publish(self.Float64MultiArray(data=[float(v) for v in dq_s]))
         else:
             h = self.args.traj_horizon
             traj = self.JointTrajectory()
@@ -1179,8 +1222,8 @@ class RosBackend(Backend):
                 self.q_cmd = self.q_ros.copy()
             L = self.args.max_cmd_lead
             self.q_cmd = self.q_ros + np.clip(self.q_cmd + dq * self.dt - self.q_ros, -L, L)
-            pt.positions = [float(v) for v in self.q_cmd + dq * h]  # ROS convention
-            pt.velocities = [float(v) for v in dq]
+            pt.positions = [float(v) for v in self.q_cmd + dq_s * h]  # ROS convention
+            pt.velocities = [float(v) for v in dq_s]
             pt.time_from_start.sec = int(h)
             pt.time_from_start.nanosec = int((h % 1.0) * 1e9)
             traj.points.append(pt)
@@ -1212,11 +1255,22 @@ class RosBackend(Backend):
             if self.args.arm_interface == "velocity":
                 self.pub_arm.publish(self.Float64MultiArray(data=[0.0] * 6))
             elif self.q is not None:
-                self.send(np.zeros(NU))  # hold current position
+                self.send(np.zeros(NU), filtered=False)  # hold current position
             time.sleep(0.02)
         self.log.info("Zero commands sent to base and arm.")
 
     def shutdown(self):
+        if self.switched and self.rclpy.ok():
+            for _ in range(5):  # standstill before the trajectory controller takes over
+                self.pub_arm.publish(self.Float64MultiArray(data=[0.0] * 6))
+                time.sleep(0.02)
+            if self._switch(self.args.arm_traj_controller, self.args.arm_vel_controller):
+                self.switched = False
+            else:
+                self.log.error(f"{self.args.arm_vel_controller} still active — the watchdog holds "
+                               f"zero velocity; switch back: ros2 control switch_controllers "
+                               f"--activate {self.args.arm_traj_controller} "
+                               f"--deactivate {self.args.arm_vel_controller}")
         self.node.destroy_node()
         if self.rclpy.ok():
             self.rclpy.shutdown()
@@ -1543,8 +1597,17 @@ def build_arg_parser(description="Steve figure-8 unified velocity-level WBC (MuJ
     g.add_argument("--cmd_vel_topic", default="/cmd_vel")
     g.add_argument("--arm_interface", choices=["trajectory", "velocity"], default="trajectory")
     g.add_argument("--arm_traj_topic", default="/scaled_joint_trajectory_controller/joint_trajectory")
-    g.add_argument("--arm_vel_topic", default="/forward_velocity_controller/commands")
+    g.add_argument("--arm_vel_topic", default="/forward_velocity_controller/commands",
+                   help="real robot: /arm_velocity_cmd (arm_velocity_watchdog), set by the launch file")
+    g.add_argument("--switch_controllers", action="store_true",
+                   help="velocity interface: activate --arm_vel_controller instead of "
+                        "--arm_traj_controller for the run and switch back afterwards")
+    g.add_argument("--arm_vel_controller", default="forward_velocity_controller")
+    g.add_argument("--arm_traj_controller", default="scaled_joint_trajectory_controller")
+    g.add_argument("--controller_manager", default="/controller_manager")
     g.add_argument("--traj_horizon", type=float, default=0.1, help="look-ahead of streamed traj point [s]")
+    g.add_argument("--arm_cmd_tau", type=float, default=0.0,
+                   help="low-pass time constant of the arm command [s] (0 = off; ~0.06 against joint buzzing)")
     g.add_argument("--max_cmd_lead", type=float, default=0.2,
                    help="max lead of the streamed arm setpoint over the measured joints [rad]")
     g.add_argument("--pan_offset", type=float, default=-np.pi / 2,

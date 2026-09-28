@@ -29,6 +29,7 @@
   <exec_depend>steve_simulation</exec_depend>
   <exec_depend>steve_navigation</exec_depend>
   <exec_depend>steve_manipulation</exec_depend>
+  <exec_depend>controller_manager_msgs</exec_depend>
 
   <test_depend>ament_copyright</test_depend>
   <test_depend>ament_flake8</test_depend>

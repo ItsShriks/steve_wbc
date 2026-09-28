@@ -106,12 +106,17 @@ def launch_setup(context: LaunchContext):
         if cfg("headless").lower() == "true":
             args.append("--headless")
     else:
+        # real robot: velocity (quiet joints, see arm_velocity_watchdog); Gazebo: trajectory
+        arm_interface = cfg("arm_interface") or ("velocity" if env == "real" else "trajectory")
         args += [
             "--mode", "ros",
-            "--arm_interface", cfg("arm_interface"),
+            "--arm_interface", arm_interface,
             "--arm_traj_topic", cfg("arm_traj_topic") or ARM_TRAJ_TOPIC[env],
             "--wait_timeout", WAIT_TIMEOUT[env],
         ]
+        if arm_interface == "velocity" and env == "real":
+            # through the bringup's arm_velocity_watchdog (zero velocity if this script stops)
+            args += ["--arm_vel_topic", "/arm_velocity_cmd", "--switch_controllers"]
         if cfg("dry_run").lower() == "true":
             args.append("--dry_run")
     # Safety stop (base + arm): the robot's EM-stop system on the real robot (buttons + scanner
@@ -159,8 +164,11 @@ def generate_launch_description():
         # --- controller / safety ---
         DeclareLaunchArgument("dry_run", default_value="false",
                               description="Read the robot state but publish no commands"),
-        DeclareLaunchArgument("arm_interface", default_value="trajectory",
-                              description="trajectory or velocity (forward_velocity_controller)"),
+        DeclareLaunchArgument("arm_interface", default_value="",
+                              description="'' = velocity on the real robot, trajectory in Gazebo | "
+                                          "trajectory (scaled_joint_trajectory_controller) or velocity "
+                                          "(forward_velocity_controller via arm_velocity_watchdog; "
+                                          "quieter joints on the real robot)"),
         DeclareLaunchArgument("arm_traj_topic", default_value="",
                               description="Override the arm JointTrajectory topic "
                                           "(default: per environment)"),

@@ -161,12 +161,22 @@ MuJoCo table and gives the WBC on the robot its table collision model and quadra
 | in | `/lidar_1/scan_filtered`, `/lidar_2/scan_filtered` | `sensor_msgs/LaserScan` (front distance; safety fallback) |
 | in | `/steve_perception/target_point` | `geometry_msgs/PointStamped` from `red_ball_detector` (active perception) |
 | out | `/cmd_vel` | `geometry_msgs/Twist` (base frame) |
-| out | `/scaled_joint_trajectory_controller/joint_trajectory` (robot) or `/joint_trajectory_controller/joint_trajectory` (Gazebo) | `trajectory_msgs/JointTrajectory` |
-| out | `/forward_velocity_controller/commands` with `arm_interface:=velocity` | `std_msgs/Float64MultiArray` |
+| out | `/arm_velocity_cmd` → `arm_velocity_watchdog` → `/forward_velocity_controller/commands` (robot, default) | `std_msgs/Float64MultiArray` |
+| out | `/joint_trajectory_controller/joint_trajectory` (Gazebo, default) or `/scaled_joint_trajectory_controller/joint_trajectory` (robot, `arm_interface:=trajectory`) | `trajectory_msgs/JointTrajectory` |
 
 The UR5e is mounted with yaw −90° in the URDF but 0 in the MJCF; `--pan_offset` (default −π/2)
-maps shoulder_pan between the two. Arm commands are streamed as a continuous integrated
-setpoint (lead over the measurement bounded by `--max_cmd_lead`).
+maps shoulder_pan between the two.
+
+**Arm interface on the real robot: velocity (default).** Streaming a new one-point trajectory
+every 20 ms makes the trajectory controller restart its spline from the measured state each
+time — the joints buzz audibly, more at speed. Velocity commands avoid that (quiet, and the
+small figure-8 tracked better: 0.12 cm vs 0.17 cm RMS). The WBC switches
+`scaled_joint_trajectory_controller` → `forward_velocity_controller` on its first command and
+back on exit, so MoveIt / `send_goal` work as before. Commands go through the bringup's
+`arm_velocity_watchdog`, which sends zero velocity when no command arrives for 0.1 s (a velocity
+controller would otherwise keep the last one). `arm_interface:=trajectory` still works (setpoint
+integrated, lead bounded by `--max_cmd_lead`; `--arm_cmd_tau 0.06` smooths the streamed
+velocity if it buzzes).
 
 ## Safety
 
