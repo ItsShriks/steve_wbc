@@ -29,15 +29,25 @@ import numpy as np
 
 
 def tables_dir():
+    """Where table models are read AND written: the package's SOURCE folder when it can be found
+    (a colcon build copies config/tables into install/ and would overwrite a model saved there),
+    else the installed share folder. Override with $STEVE_TABLES_DIR."""
+    import os
+    if os.environ.get("STEVE_TABLES_DIR"):
+        return Path(os.environ["STEVE_TABLES_DIR"]).expanduser()
     here = Path(__file__).resolve().parent
-    for d in (here.parent / "config" / "tables", here / "config" / "tables"):
+    cands = [here.parent / "config" / "tables", here / "config" / "tables"]
+    try:
+        from ament_index_python.packages import get_package_prefix, get_package_share_directory
+        share = Path(get_package_share_directory("steve_wbc"))
+        ws = Path(get_package_prefix("steve_wbc")).parent.parent      # <ws>/install/steve_wbc -> <ws>
+        cands += [ws / "src" / "steve_wbc" / "config" / "tables", share / "config" / "tables"]
+    except Exception:
+        pass
+    for d in cands:
         if d.is_dir():
             return d
-    try:
-        from ament_index_python.packages import get_package_share_directory
-        return Path(get_package_share_directory("steve_wbc")) / "config" / "tables"
-    except Exception:
-        return here.parent / "config" / "tables"
+    return cands[0]
 
 
 @dataclass
@@ -125,6 +135,100 @@ class TableModel:
 
 
 # ── fitting (table_probe) ────────────────────────────────────────────────────
+def lidar_clusters(pts, link=0.04):
+    """Greedy single-linkage clusters of Nx2 points (grid-hashed, fast enough for a few 1000 pts)."""
+    pts = np.unique(np.round(np.asarray(pts, float), 3), axis=0)
+    cell = {}
+    for i, p in enumerate(pts):
+        cell.setdefault((int(p[0] // link), int(p[1] // link)), []).append(i)
+    label = -np.ones(len(pts), int)
+    k = 0
+    for i in range(len(pts)):
+        if label[i] >= 0:
+            continue
+        label[i], stack = k, [i]
+        while stack:
+            j = stack.pop()
+            cx, cy = int(pts[j][0] // link), int(pts[j][1] // link)
+            for dx in (-1, 0, 1):
+                for dy in (-1, 0, 1):
+                    for m in cell.get((cx + dx, cy + dy), ()):
+                        if label[m] < 0 and np.hypot(*(pts[m] - pts[j])) < link:
+                            label[m] = k
+                            stack.append(m)
+        k += 1
+    return [pts[label == c] for c in range(k)]
+
+
+def fit_table_lidar(lidar, robot, top_z, overhang=0.03, leg_r=0.025, max_yaw_deg=20.0,
+                    side=(0.35, 2.0), max_dist=3.5):
+    """
+    Table from the LiDAR alone (no camera): four legs = four compact clusters forming a rectangle
+    in front of the robot, roughly square to it. The LiDARs scan at ~0.22 m, so the top plate is
+    invisible: its height `top_z` is given, its outline is the leg rectangle + `overhang`.
+      lidar  M x 2 points (frame of `robot`), robot = ((x, y), yaw) in that frame
+    Returns (TableModel, info) or raises ValueError. The best rectangle (smallest shape error,
+    then nearest) is chosen; info["candidates"] lists the runner-ups to judge ambiguity.
+    """
+    from itertools import combinations
+    (rx, ry), ryaw = robot
+    Rr = np.array([[np.cos(ryaw), -np.sin(ryaw)], [np.sin(ryaw), np.cos(ryaw)]])
+    loc = (np.asarray(lidar, float) - [rx, ry]) @ Rr          # robot frame: x forward
+    front = loc[(loc[:, 0] > 0.3) & (loc[:, 0] < max_dist) & (np.abs(loc[:, 1]) < max_dist)]
+    clusters = lidar_clusters(front)
+    legs = [c.mean(0) for c in clusters if len(c) >= 3 and np.ptp(c, axis=0).max() < 0.10]
+    if len(legs) < 4:
+        raise ValueError(f"only {len(legs)} leg-like clusters in front of the robot")
+    legs = np.array(legs)[np.argsort(np.hypot(*np.array(legs).T))][:40]   # nearest 40
+    cands = []
+    for quad in combinations(range(len(legs)), 4):
+        P = legs[list(quad)]
+        for a, b, c, d in ((0, 1, 2, 3), (0, 2, 1, 3), (0, 3, 1, 2)):   # (a,b) and (c,d) = diagonals
+            m1, m2 = 0.5 * (P[a] + P[b]), 0.5 * (P[c] + P[d])
+            d1, d2 = np.hypot(*(P[a] - P[b])), np.hypot(*(P[c] - P[d]))
+            err = np.hypot(*(m1 - m2)) + abs(d1 - d2)
+            if err > 0.06:
+                continue
+            s1, s2 = np.hypot(*(P[a] - P[c])), np.hypot(*(P[a] - P[d]))
+            if not (side[0] <= min(s1, s2) and max(s1, s2) <= side[1]):
+                continue
+            ctr = 0.5 * (m1 + m2)
+            if ctr[0] < 0.5:
+                continue
+            e1 = P[c] - P[a] if s1 >= s2 else P[d] - P[a]       # a side of the rectangle
+            ang = np.arctan2(e1[1], e1[0])
+            yaw = (ang + np.pi / 4) % (np.pi / 2) - np.pi / 4     # table axis closest to robot x
+            if abs(np.degrees(yaw)) > max_yaw_deg:
+                continue
+            cands.append((err, float(np.hypot(*ctr)), ctr, yaw, P))
+    if not cands:
+        raise ValueError(f"no rectangle of 4 legs found among {len(legs)} leg-like clusters")
+    cands.sort(key=lambda c: (round(c[0], 2), c[1]))
+    err, dist, ctr, yaw, P = cands[0]
+    Rt = np.array([[np.cos(yaw), -np.sin(yaw)], [np.sin(yaw), np.cos(yaw)]])
+    leg_t = (P - ctr) @ Rt                                        # legs in the table frame
+    hx, hy = np.abs(leg_t[:, 0]).max(), np.abs(leg_t[:, 1]).max()
+    # back to the input frame
+    center = Rr @ ctr + [rx, ry]
+    legs_all = [[float(x), float(y), leg_r] for x, y in leg_t]
+    # further leg-like clusters UNDER the top (a 5th / centre leg, a support): obstacles for the
+    # base as well; anything outside the top outline (chairs, other furniture) is not the table
+    extra = []
+    for q in legs:
+        if np.min(np.hypot(*(P - q).T)) < 0.05:
+            continue                                              # one of the four corner legs
+        ql = (q - ctr) @ Rt
+        if abs(ql[0]) < hx + overhang and abs(ql[1]) < hy + overhang:
+            extra.append([float(ql[0]), float(ql[1]), leg_r])
+    legs_all += extra
+    t = TableModel(name="table", center=[float(v) for v in center], yaw=float(ryaw + yaw),
+                   size=[float(2 * (hx + overhang)), float(2 * (hy + overhang))], top_z=float(top_z),
+                   legs=legs_all)
+    return t, {"lidar_under": front, "clusters": clusters, "shape_err": err, "extra_legs": len(extra),
+               "candidates": [(c[0], c[2], np.degrees(c[3])) for c in cands[:5]],
+               "legs_robot": P, "leg_like": legs}
+
+
 def fit_table(cloud, lidar, robot_xy=(0.0, 0.0), z_range=(0.5, 1.3), leg_r=0.03):
     """
     Table from measurements in one frame (z up):

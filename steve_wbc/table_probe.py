@@ -31,10 +31,10 @@ import time
 import numpy as np
 
 try:
-    from steve_wbc.table_model import TableModel, fit_table, tables_dir
+    from steve_wbc.table_model import TableModel, fit_table, fit_table_lidar, tables_dir
     from steve_manipulation.safety_stop import SCAN_TOPICS, FOOTPRINT_MAX, FOOTPRINT_MIN, D_SAFE, ScanPoints
 except ImportError:
-    from table_model import TableModel, fit_table, tables_dir
+    from table_model import TableModel, fit_table, fit_table_lidar, tables_dir
     from steve_manipulation.safety_stop import SCAN_TOPICS, FOOTPRINT_MAX, FOOTPRINT_MIN, D_SAFE, ScanPoints
 
 HEAD = "/pan_tilt_camera/pan_tilt_camera"
@@ -157,8 +157,10 @@ def plot(path, table, lidar, info, robot, title):
 def publish_markers(node, table, frame):
     from visualization_msgs.msg import Marker, MarkerArray
     from rclpy.qos import DurabilityPolicy, QoSProfile
-    pub = node.create_publisher(MarkerArray, "/table_probe/markers",
-                                QoSProfile(depth=1, durability=DurabilityPolicy.TRANSIENT_LOCAL))
+    pub = getattr(node, "_table_marker_pub", None)
+    if pub is None:
+        pub = node._table_marker_pub = node.create_publisher(
+            MarkerArray, "/table_probe/markers", QoSProfile(depth=1, durability=DurabilityPolicy.TRANSIENT_LOCAL))
     ma = MarkerArray()
 
     def marker(i, kind, xyz, scale, rgba, yaw=0.0):
@@ -189,7 +191,58 @@ def main(argv=None):
                    help="frame convention of the depth image's frame (Gazebo head camera: x_forward)")
     p.add_argument("--lidar_topics", nargs="+", default=list(SCAN_TOPICS["real"]))
     p.add_argument("--seconds", type=float, default=2.0, help="measurement time")
+    p.add_argument("--lidar_only", action="store_true",
+                   help="no camera: find the 4 legs in the LiDAR scan (rectangle in front of the "
+                        "robot, roughly square to it); the top height must be given with --top_z")
+    p.add_argument("--top_z", type=float, default=None,
+                   help="table top height above the floor [m] (--lidar_only; without it the table "
+                        "is only detected and plotted, not saved)")
+    p.add_argument("--overhang", type=float, default=0.03, help="top plate beyond the legs [m]")
+    p.add_argument("--show", metavar="TABLE",
+                   help="only show a saved model in RViz (MarkerArray /table_probe/markers, frame of "
+                        "the model) until Ctrl+C — no measurement")
+    if argv is None:  # strip --ros-args (when started from a launch file)
+        try:
+            from rclpy.utilities import remove_ros_args
+            argv = remove_ros_args(sys.argv)[1:]
+        except ImportError:
+            argv = sys.argv[1:]
     a = p.parse_args(argv)
+
+    if a.show:
+        # keeps publishing the model; reloads it whenever the file changes (a new table_probe run)
+        # and waits if it does not exist yet — started by hardware_bringup.launch.py
+        import rclpy
+        from rclpy.executors import ExternalShutdownException
+        path = tables_dir() / f"{a.show}.yaml"
+        rclpy.init()
+        node = rclpy.create_node("table_probe_show")
+        table, mtime, waiting = None, None, False
+        try:
+            while rclpy.ok():
+                try:
+                    m = path.stat().st_mtime
+                except OSError:
+                    m = None
+                    if not waiting:
+                        print(f"waiting for {path} (run table_probe --lidar_only ...)")
+                        waiting = True
+                if m is not None and m != mtime:
+                    try:
+                        table, mtime, waiting = TableModel.load(a.show), m, False
+                        print(f"showing '{a.show}' ({table.notes}): centre {np.round(table.center, 3)} "
+                              f"{table.frame}, top {table.top_z:.2f} m, {len(table.legs)} legs — RViz: "
+                              f"Fixed Frame {table.frame}, MarkerArray /table_probe/markers")
+                    except Exception as e:  # half-written file: retry next second
+                        print(f"cannot read {path}: {e}")
+                if table is not None:
+                    publish_markers(node, table, table.frame)
+                t_end = time.monotonic() + 1.0
+                while time.monotonic() < t_end:
+                    rclpy.spin_once(node, timeout_sec=0.1)
+        except (KeyboardInterrupt, ExternalShutdownException):
+            pass
+        return 0
 
     probe = Probe(a)
     lidar, cloud, robot = probe.collect(a.seconds)
@@ -203,6 +256,32 @@ def main(argv=None):
             print(f"  leg {i} at {np.round(w, 3)}: nearest LiDAR point {d * 100:+.1f} cm "
                   f"{'OK' if abs(d) < 0.05 else '<- model and reality differ (table moved? re-probe)'}")
         info, out = None, tables_dir() / f"{a.check}_check.png"
+    elif a.lidar_only:
+        try:
+            table, info = fit_table_lidar(lidar, robot, a.top_z if a.top_z else 0.75, a.overhang)
+        except ValueError as e:
+            sys.exit(f"[ERROR] {e}")
+        table.name, table.frame = a.name, a.frame
+        # in the robot frame (what one would measure with a tape)
+        (rx, ry), ryaw = robot
+        Rr = np.array([[np.cos(ryaw), -np.sin(ryaw)], [np.sin(ryaw), np.cos(ryaw)]])
+        c_r = (np.asarray(table.center) - [rx, ry]) @ Rr
+        print(f"table found (LiDAR, {len(info['leg_like'])} leg-like clusters, shape error "
+              f"{info['shape_err'] * 100:.1f} cm): centre {c_r[0]:.2f} m ahead, {c_r[1]:+.2f} m left, "
+              f"rotated {np.degrees(table.yaw - ryaw):+.1f}°, top {table.size[0]:.2f} x {table.size[1]:.2f} m, "
+              f"{len(table.legs)} legs ({info['extra_legs']} besides the 4 corners)")
+        for i, (e, ctr, yaw) in enumerate(info["candidates"][1:4], 1):
+            print(f"  alternative {i}: centre {ctr[0]:.2f} m ahead {ctr[1]:+.2f} m left, {yaw:+.1f}°, "
+                  f"shape error {e * 100:.1f} cm")
+        info["plane_inliers"] = []
+        if a.top_z is None:
+            out = tables_dir() / f"{a.name}_lidar_detect.png"
+            print("  not saved: give the top height with --top_z <m> to save the model")
+        else:
+            table.notes = f"table_probe --lidar_only {time.strftime('%Y-%m-%d %H:%M')}: top_z given"
+            path = table.save()
+            print(f"saved {path}")
+            out = path.with_suffix(".png")
     else:
         try:
             table, info = fit_table(cloud, lidar, robot[0])

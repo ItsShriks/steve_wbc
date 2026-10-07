@@ -14,7 +14,8 @@ Input npz keys
   depth_<i>     : (H, W) float32  metres
   cam_pos_<i>   : (3,) float64    world position of camera
   cam_mat_<i>   : (9,) float64    cam-to-world rotation (row-major 3×3)
-  fovy_<i>      : float64 scalar  vertical fov (degrees)
+  fovy_<i>      : float64 scalar  vertical fov (degrees)        [MuJoCo views]
+  intr_<i>      : (4,) float64    fx, fy, cx, cy; cam_mat is then world<-ROS optical frame [real views]
   img_h_<i>     : int scalar
   img_w_<i>     : int scalar
 
@@ -78,18 +79,20 @@ def main():
         depth   = data[f"depth_{i}"].astype(np.float32)
         cam_pos = data[f"cam_pos_{i}"]                      # (3,)
         cam_mat = data[f"cam_mat_{i}"].reshape(3, 3)        # world←cam
-        # Convert MuJoCo camera frame (+X right, +Y up, -Z forward)
-        # to Open3D camera frame (+X right, +Y down, +Z forward)
-        cam_mat = cam_mat @ np.diag([1.0, -1.0, -1.0])
-        fovy    = float(data[f"fovy_{i}"])
         img_h   = int(data[f"img_h_{i}"])
         img_w   = int(data[f"img_w_{i}"])
-
-        # Camera intrinsics from fovy
-        fy = 0.5 * img_h / np.tan(np.deg2rad(fovy) / 2.0)
-        fx = fy
-        cx = img_w / 2.0
-        cy = img_h / 2.0
+        if f"intr_{i}" in data:
+            # real camera: ROS optical frame (+X right, +Y down, +Z forward) = Open3D's,
+            # intrinsics [fx, fy, cx, cy] from camera_info
+            fx, fy, cx, cy = (float(v) for v in data[f"intr_{i}"])
+        else:
+            # MuJoCo camera frame (+X right, +Y up, -Z forward) -> Open3D camera frame
+            cam_mat = cam_mat @ np.diag([1.0, -1.0, -1.0])
+            fovy = float(data[f"fovy_{i}"])
+            fy = 0.5 * img_h / np.tan(np.deg2rad(fovy) / 2.0)
+            fx = fy
+            cx = img_w / 2.0
+            cy = img_h / 2.0
         intrinsic = CameraIntrinsic(img_w, img_h, fx, fy, cx, cy)
 
         # Build T_cam_tsdf = T_cam_world @ T_world_tsdf

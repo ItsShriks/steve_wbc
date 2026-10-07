@@ -38,6 +38,13 @@ ARM_TRAJ_TOPIC = {
 }
 # Gazebo needs time to start, spawn the robot and activate controllers
 WAIT_TIMEOUT = {"gazebo": "120", "real": "15"}
+# motion_split -> WBC weights. equal: base and arm each ~50 % of the EE motion (measured on the
+# table figure-8, kinematic check: base 47 % forward / 52-56 % sideways)
+SPLITS = {
+    "base": [],                                                              # default: base does most
+    "equal": ["--w_base_x", "14", "--w_base_y", "6", "--k_posture", "0", "--lock_yaw"],
+    "arm": ["--max_base_v", "0", "--lock_yaw", "--k_posture", "0"],          # base stands still
+}
 # Default figure-8 centre height in Gazebo [m]
 GAZEBO_CZ = "1.1"
 
@@ -74,6 +81,15 @@ def launch_setup(context: LaunchContext):
         # ROS_AUTOSTART.sh already runs steve_hardware_bringup: never start a second one
         print("[INFO] steve_wbc: robot bringup already running (/controller_manager found, e.g. "
               "ROS_AUTOSTART.sh) — using it instead of starting another")
+    elif launch_bringup and env == "real" and bringup_arg != "true":
+        # never start a (second) UR driver implicitly on the real robot: the bringup runs in its own
+        # screen session (ROS_AUTOSTART.sh); a missed detection once started two drivers
+        raise RuntimeError(
+            "no robot bringup found (no UR driver process / /controller_manager). Start it first:\n"
+            "  screen -S bringup -L -Logfile ~/ros_logs/bringup.log bash -c \"source "
+            "~/steve_ros2_ws/install/setup.bash && ros2 launch steve_hardware_bringup "
+            "hardware_bringup.launch.py enable_joystick:=false\"\n"
+            "or let this launch start it with launch_bringup:=true")
     elif launch_bringup and env == "real":
         actions.append(IncludeLaunchDescription(
             PythonLaunchDescriptionSource(os.path.join(
@@ -100,6 +116,10 @@ def launch_setup(context: LaunchContext):
         args += ["--cz", cz]
     if cfg("log"):
         args += ["--log", cfg("log")]
+    if cfg("table"):
+        args += ["--table", cfg("table"), "--table_clearance", cfg("table_clearance")]
+    if cfg("goto_table"):
+        args += ["--goto_table", cfg("goto_table")]
 
     if env == "mujoco":
         args += ["--mode", "sim"]
@@ -125,7 +145,12 @@ def launch_setup(context: LaunchContext):
         args += ["--safety", "em_stop"]
     elif env == "gazebo":
         args += ["--safety", "lidar", "--lidar_topics", *SCAN_TOPICS["gazebo"]]
-    args += shlex.split(cfg("extra_args"))
+    # who does the motion (the posture level's weights; the EE path stays exact)
+    split = cfg("motion_split")
+    if split not in SPLITS:
+        raise RuntimeError(f"motion_split must be one of {list(SPLITS)}, got '{split}'")
+    args += SPLITS[split]
+    args += shlex.split(cfg("extra_args"))   # extra_args last: they override
 
     actions.append(Node(
         package="steve_wbc",
@@ -177,7 +202,18 @@ def generate_launch_description():
         DeclareLaunchArgument("frequency", default_value="0.45", description="[rad/s]"),
         DeclareLaunchArgument("loops", default_value="3"),
         DeclareLaunchArgument("plane", default_value="vertical", description="vertical or horizontal"),
-        DeclareLaunchArgument("orientation", default_value="hold", description="hold or forward"),
+        DeclareLaunchArgument("orientation", default_value="hold", description="hold, forward or down"),
+        DeclareLaunchArgument("motion_split", default_value="base",
+                              description="who does the figure-8: base (default, base does most), "
+                                          "equal (base and arm ~50/50), arm (base stands still)"),
+        DeclareLaunchArgument("table", default_value="",
+                              description="table model (config/tables/<name>.yaml): collision model; with "
+                                          "plane:=horizontal the 8 is drawn over the table"),
+        DeclareLaunchArgument("goto_table", default_value="",
+                              description="instead of a figure-8: gripper this many m above the table "
+                                          "centre, pointing down (needs table:=)"),
+        DeclareLaunchArgument("table_clearance", default_value="0.10",
+                              description="height of the 8 above the table top [m]"),
         DeclareLaunchArgument("cz", default_value="", description="figure-8 centre height [m] (default: start EE; Gazebo: 1.1)"),
         DeclareLaunchArgument("log", default_value="", description="CSV log path"),
         DeclareLaunchArgument("extra_args", default_value="",

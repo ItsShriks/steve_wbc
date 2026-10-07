@@ -234,6 +234,22 @@ class VGNBridge:
         )
         return len(self._views)
 
+    def add_real_view(self, depth: np.ndarray, cam_pos: np.ndarray, R_world_optical: np.ndarray,
+                      K: np.ndarray, center_approx: np.ndarray) -> int:
+        """A real depth image (metres, 0 = invalid) with its camera pose: position and
+        world<-ROS optical frame rotation (from TF) and the 3x3 intrinsic matrix."""
+        if not self.available:
+            return 0
+        if self._tsdf_origin is None:
+            self.init_tsdf(np.asarray(center_approx, float))
+        d = np.asarray(depth, np.float32).copy()
+        d[(d > MAX_DEPTH) | (d < 1e-6) | ~np.isfinite(d)] = 0.0
+        self._views.append({"depth": d, "cam_pos": np.asarray(cam_pos, float),
+                            "cam_mat": np.asarray(R_world_optical, float).flatten(),
+                            "img_h": d.shape[0], "img_w": d.shape[1], "fovy": 0.0,
+                            "intr": np.array([K[0, 0], K[1, 1], K[0, 2], K[1, 2]], float)})
+        return len(self._views)
+
     # ── Environment health check (runs in the background) ────────────────────
     # vgn_env must import torch + open3d and exchange arrays with NumPy; a broken env
     # (e.g. torch built against NumPy 1.x with NumPy 2 installed, or x86_64 wheels that
@@ -285,6 +301,8 @@ class VGNBridge:
             npz_data[f"fovy_{i}"] = np.array(v["fovy"])
             npz_data[f"img_h_{i}"] = np.array(v["img_h"])
             npz_data[f"img_w_{i}"] = np.array(v["img_w"])
+            if "intr" in v:
+                npz_data[f"intr_{i}"] = v["intr"]
         with tempfile.NamedTemporaryFile(suffix=".npz", delete=False, prefix="vgn_views_") as nf:
             self._npz_path = nf.name
         np.savez_compressed(self._npz_path, **npz_data)

@@ -48,6 +48,10 @@ setup(
             'target_calibrator = steve_wbc.target_calibrator:main',
             # measure the real table (LiDAR + head depth) into a table model for WBC / MuJoCo
             'table_probe = steve_wbc.table_probe:main',
+            # drive straight until the first obstacle ahead is at a safe distance -> table model
+            'table_approach = steve_wbc.table_approach:main',
+            # real robot: wrist-camera depth -> VGN -> grasp on the object on the table (PC, vgn_env)
+            'vgn_grasp_real = steve_wbc.vgn_grasp_real:main',
         ],
     },
 )

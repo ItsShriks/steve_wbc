@@ -1,16 +1,31 @@
 # steve_wbc
 
 Unified velocity-level (kinematic) **whole-body controller** for Steve
-(Neobotix MMO-700 omnidirectional base + UR5e). Base and arm velocities come from
-**one** constrained QP over all 9 DOF — `u = [vx_b, vy_b, wz_b, dq1..dq6]`:
+(Neobotix MMO-700 omnidirectional base + UR5e) over all 9 DOF —
+`u = [vx_b, vy_b, wz_b, dq1..dq6]` — as a **strict task hierarchy** (default,
+`--hierarchy strict`): one constrained least-squares problem per priority level, each level
+restricted to the solutions that keep what the levels above achieved:
 
 ```
-min_u  || J_wb u - v_ee ||²_Wt                 EE pose task (primary)
-     + w_b || u_base - u_base_des ||²          soft base-pose task (optional)
-     + || u - N·K(q_nom - q) ||²_Wu             null-space posture + effort
-s.t.   velocity / acceleration / joint-position limits
-       collision avoidance (arm vs table, obstacles, floor, own body; base vs environment)
+1. EE pose     min || J_wb u - v_ee ||²_Wt
+2. base pose   min || u_base - u_base_des ||²           (only when a base task is set)
+3. posture     min || u - K(q_nom - q) ||²_Wu          (+ effort; base/arm split via W_u)
+every level s.t.  velocity / acceleration / joint-position limits
+                  collision avoidance (arm vs table, obstacles, floor, own body; base vs environment)
+                  | A_i u - A_i u_i | <= hqp_tol   for all higher levels i
 ```
+
+A lower task can never degrade a higher one, also when limits or collision constraints are
+active (a level that cannot be solved is dropped, the higher levels' result kept). Weights act
+only within a level. `--hierarchy weighted` keeps the previous single QP
+(`|| J u - v_ee ||²_Wt + w_b || u_base - u_base_des ||² + || u - N·K(q_nom - q) ||²_Wu`).
+
+| Kinematic check (`figure8_wbc_demo --mode kin`) | weighted | strict |
+|---|---|---|
+| Phase 1 — table figure-8 while the base orbits (EE vs base task compete) | 0.55 / 1.90 cm, 1.30° | **0.01 / 0.03 cm, 0.00°** |
+| Phase 2 — vertical figure-8 (nothing competes) | 0.03 / 0.04 cm | 0.02 / 0.04 cm |
+
+(EE position RMS / max, orientation max; mean QP time ~10–13 ms for both.)
 
 `J_wb` is the exact whole-body Jacobian from the MuJoCo model (`models/mmo_700_wbc.xml`),
 including the lever arm of base yaw. The same controller runs in MuJoCo, Gazebo and on
@@ -164,7 +179,7 @@ MuJoCo table and gives the WBC on the robot its table collision model and quadra
 | out | `/arm_velocity_cmd` → `arm_velocity_watchdog` → `/forward_velocity_controller/commands` (robot, default) | `std_msgs/Float64MultiArray` |
 | out | `/joint_trajectory_controller/joint_trajectory` (Gazebo, default) or `/scaled_joint_trajectory_controller/joint_trajectory` (robot, `arm_interface:=trajectory`) | `trajectory_msgs/JointTrajectory` |
 
-The UR5e is mounted with yaw −90° in the URDF but 0 in the MJCF; `--pan_offset` (default −π/2)
+The UR5e is mounted with yaw +90° in the URDF (checked on the real robot; was −90°) but 0 in the MJCF; `--pan_offset` (default +π/2)
 maps shoulder_pan between the two.
 
 **Arm interface on the real robot: velocity (default).** Streaming a new one-point trajectory

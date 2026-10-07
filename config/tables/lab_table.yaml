@@ -1,0 +1,30 @@
+# Table 'lab_table' — see steve_wbc/table_model.py (table_probe writes these)
+name: lab_table
+frame: odom
+center:
+- 1.0868
+- -0.0391
+yaw: -0.0974
+size:
+- 0.8699
+- 0.8516
+top_z: 0.8
+thickness: 0.05
+legs:
+- - -0.37
+  - -0.3847
+  - 0.025
+- - -0.4049
+  - 0.3735
+  - 0.025
+- - 0.3929
+  - -0.3847
+  - 0.025
+- - 0.3821
+  - 0.3958
+  - 0.025
+- - -0.3912
+  - -0.0007
+  - 0.025
+skirt: 0.0
+notes: 'table_probe --lidar_only 2026-10-07 13:21: top_z given'

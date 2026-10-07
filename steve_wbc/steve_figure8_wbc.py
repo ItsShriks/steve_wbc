@@ -30,7 +30,20 @@ Secondary task (posture), projected into the null space of J_wb so it cannot
 disturb the EE task:
     u_sec = N_W * [0, 0, Ky (yaw_0 - yaw), Kq (q_0 - q)],   N_W = I - J_W^+ J
 
-Constrained weighted QP (bounded least squares, solved exactly by BVLS):
+Strict task hierarchy (default, --hierarchy strict): one constrained least-squares
+problem per priority level, each lower level restricted to the solutions that keep
+what the levels above achieved (|A_i u - A_i u_i| <= --hqp_tol):
+
+    1. EE pose        min || J_wb u - v_des ||^2_{W_t}
+    2. base pose      min || u_base - u_base_des ||^2        (only if a base task is set)
+    3. posture        min || u - u_post ||^2_{W_u}           (u_post unprojected)
+    all levels s.t. lb <= u <= ub, collision constraints C u >= c
+
+A level that cannot be solved is dropped and the higher levels' solution kept, so a
+lower task never degrades a higher one; W_t / W_u only weigh rows WITHIN a level.
+
+Weighted alternative (--hierarchy weighted): one constrained weighted QP (bounded
+least squares, solved exactly by BVLS):
 
     min_u  || J_wb u - v_des ||^2_{W_t}  +  || u - u_sec ||^2_{W_u}
            [ + w_b || u_base - u_base_des ||^2   optional soft base-pose task ]
@@ -77,6 +90,12 @@ except ImportError:
 
 # ── Model lookup ──────────────────────────────────────────────────────────────
 SCRIPT_DIR = Path(__file__).resolve().parent
+
+try:  # measured / hand-written table (config/tables/<name>.yaml), --table
+    from steve_wbc.table_model import TableModel
+except ImportError:
+    sys.path.insert(0, str(SCRIPT_DIR))
+    from table_model import TableModel
 
 try:  # safety stop shared with steve_manipulation (manipulator)
     from steve_manipulation.safety_stop import (EM_STOP_TOPIC, SCAN_TOPICS, ClearTimer, EmStopMonitor,
@@ -138,6 +157,7 @@ SIM_ARM_Q0 = [0.0, -1.2, 1.2, -1.6, -1.57, 0.0]
 
 # Wrist pointing along the base +X axis (used by --orientation forward)
 R_FORWARD = np.array([[0, 0, 1], [0, 1, 0], [-1, 0, 0]], dtype=float)
+R_TOPDOWN = np.array([[1, 0, 0], [0, -1, 0], [0, 0, -1]], dtype=float)   # gripper pointing down
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -338,19 +358,24 @@ class CollisionAvoidance:
               and m.geom_type[g] == T.mjGEOM_MESH]
         corners = np.vstack([self._box_corners(*self._geom_box(g)[1:4]) for g in bg])
         self.base_xy_min, self.base_xy_max = corners[:, :2].min(0), corners[:, :2].max(0)
-        # the base column reaches up to the cabinet top: a table's top plate (no skirt, only
-        # legs the LiDAR sees) must block the base as well
-        z_hi = corners[:, 2].max()
+        # two parts with their own footprint (base frame) and height band:
+        #   low  = the base body: keeps --d_safe_base (LiDAR safety field) from legs, walls, ...
+        #   high = cabinet + the arm's mount on it: keeps --d_safe_top from things above the base
+        #          only, e.g. a table's top plate — the base itself fits under the overhang
+        self.base_z = (corners[:, 2].min(), corners[:, 2].max())
         kin.set_state(RobotState(np.zeros(3), np.zeros(6)))
-        for bn in ("cabinet_link", "ur5e_base"):  # cabinet + the arm's mount on it
+        hp = []
+        for bn in ("cabinet_link", "ur5e_base"):
             b = mujoco.mj_name2id(m, mujoco.mjtObj.mjOBJ_BODY, bn)
             if b < 0:
                 continue
-            dz = kin.data.xpos[b][2] - kin.data.xpos[self.base_body][2]
+            Rb, pb = kin.data.xmat[b].reshape(3, 3), kin.data.xpos[b] - kin.data.xpos[self.base_body]
             for g in range(m.ngeom):
                 if m.geom_bodyid[g] == b:
-                    z_hi = max(z_hi, dz + self._box_corners(*self._geom_box(g)[1:4])[:, 2].max())
-        self.base_z = (corners[:, 2].min(), z_hi)
+                    hp.append(pb + self._box_corners(*self._geom_box(g)[1:4]) @ Rb.T)
+        hp = np.vstack(hp) if hp else corners
+        self.top_xy_min, self.top_xy_max = hp[:, :2].min(0), hp[:, :2].max(0)
+        self.top_z = (hp[:, 2].min(), hp[:, 2].max())
         self.env_footprints = []  # (polygon xy, name) of env boxes overlapping the base height
         self._ignored = set()
         self._checked_start = False
@@ -504,30 +529,37 @@ class CollisionAvoidance:
                 out.append((sd[j], X[i], self.s_body[i], C + Rw @ Q[j], bb if moving else None, n,
                             f"{self.gname(gi)}/{name}", (gi, bi)))
 
-        # base footprint vs env footprints (2-D)
+        # base vs env footprints (2-D): the base body against what reaches into its height band,
+        # the cabinet + arm mount against what is only above it (a table top)
         if self.n_env_boxes:
             bp = d.xpos[self.base_body]
             bR = d.xmat[self.base_body].reshape(3, 3)
-            lo, hi = self.base_xy_min, self.base_xy_max
-            rect = np.array([[lo[0], lo[1]], [hi[0], lo[1]], [hi[0], hi[1]], [lo[0], hi[1]]])
-            A = bp[:2] + rect @ bR[:2, :2].T
-            zlo, zhi = bp[2] + self.base_z[0], bp[2] + self.base_z[1]
+
+            def footprint(lo, hi):
+                rect = np.array([[lo[0], lo[1]], [hi[0], lo[1]], [hi[0], hi[1]], [lo[0], hi[1]]])
+                return bp[:2] + rect @ bR[:2, :2].T
+            parts = (("base", footprint(self.base_xy_min, self.base_xy_max), self.base_z, a.d_influence_base),
+                     ("basetop", footprint(self.top_xy_min, self.top_xy_max), self.top_z, a.d_influence))
             for bb, bc, bR_, bh, name, moving in self.boxes[:self.n_env_boxes]:
                 cw = self._box_corners(d.xpos[bb] + d.xmat[bb].reshape(3, 3) @ bc,
                                        d.xmat[bb].reshape(3, 3) @ bR_, bh)
-                if cw[:, 2].max() < zlo or cw[:, 2].min() > zhi:
-                    continue
-                c2 = cw[:, :2]
-                if np.linalg.norm(c2.mean(0) - A.mean(0)) > 2.0 + a.d_influence_base:
-                    continue
-                dist, pA, pB = self._poly_distance(A, self._convex_hull(c2))
-                if dist >= a.d_influence_base:
-                    continue
-                v = pA - pB  # from obstacle to base; for overlaps pB = pA - depth*axis, so also outward
-                n2 = v / max(np.linalg.norm(v), 1e-12)
-                z = 0.5 * (zlo + zhi)
-                out.append((dist, np.array([*pA, z]), self.base_body, np.array([*pB, z]), None,
-                            np.array([*n2, 0.0]), f"base/{name}"))
+                for part, A, (z0, z1), d_inf in parts:
+                    zlo, zhi = bp[2] + z0, bp[2] + z1
+                    if cw[:, 2].max() < zlo or cw[:, 2].min() > zhi:
+                        continue
+                    if part == "basetop" and cw[:, 2].min() <= bp[2] + self.base_z[1]:
+                        continue  # reaches down to the base: handled by the base part
+                    c2 = cw[:, :2]
+                    if np.linalg.norm(c2.mean(0) - A.mean(0)) > 2.0 + d_inf:
+                        continue
+                    dist, pA, pB = self._poly_distance(A, self._convex_hull(c2))
+                    if dist >= d_inf:
+                        continue
+                    v = pA - pB  # from obstacle to base; for overlaps pB = pA - depth*axis, so also outward
+                    n2 = v / max(np.linalg.norm(v), 1e-12)
+                    z = 0.5 * (zlo + zhi)
+                    out.append((dist, np.array([*pA, z]), self.base_body, np.array([*pB, z]), None,
+                                np.array([*n2, 0.0]), f"{part}/{name}"))
         return out
 
     def constraints(self, yaw):
@@ -551,7 +583,11 @@ class CollisionAvoidance:
         for p in pairs:
             dist, pa, ba, pb, bb, n, label = p[:7]
             obs = label.rsplit("/", 1)[-1]
-            if ba == self.base_body:  # (by body: the gripper also has a body named "base")
+            if ba == self.base_body and label.startswith("basetop/"):
+                # cabinet / arm mount vs something above the base (table top): no LiDAR field there
+                d_s, d_i = a.d_safe_top, a.d_influence
+                self.base_clearance = min(self.base_clearance, dist)
+            elif ba == self.base_body:  # (by body: the gripper also has a body named "base")
                 # the base keeps its own, never relaxed safety distance (LiDAR safety field),
                 # aimed BASE_LAG_BUFFER inside it: the drives follow cmd_vel with a lag
                 d_s, d_i = a.d_safe_base + BASE_LAG_BUFFER, a.d_influence_base
@@ -629,10 +665,13 @@ class Figure8Reference:
         up = np.array([0.0, 0.0, 1.0])
         a_hat, b_hat = (lat, up) if args.plane == "vertical" else (fwd, lat)
         center = p0.copy()
+        if getattr(args, "center_xy", None) is not None:   # e.g. over the table (--table)
+            center[:2] = args.center_xy
         if args.cz is not None:
             center[2] = args.cz
-        # Orientation: hold start orientation, or rotate to "wrist forward"
-        R_goal = R0 if args.orientation == "hold" else rot_z(yaw0) @ R_FORWARD
+        # Orientation: hold the start orientation, turn the wrist to point along base +X, or down
+        R_goal = {"hold": R0, "forward": rot_z(yaw0) @ R_FORWARD,
+                  "down": rot_z(yaw0) @ R_TOPDOWN}[args.orientation]
         return cls(p0, R0, center, a_hat, b_hat, args.amplitude, args.amplitude,
                    args.frequency, args.loops, args.ramp_time, R_goal)
 
@@ -686,6 +725,82 @@ class Figure8Reference:
 # ══════════════════════════════════════════════════════════════════════════════
 # Whole-body QP controller
 # ══════════════════════════════════════════════════════════════════════════════
+class GotoReference:
+    """Point-to-point EE reference through waypoints [(p, R), ...]: min-jerk position and
+    orientation per segment (speed-limited), then hold the last one for `hold` s. Used for
+    --goto_file (VGN grasp: pre-grasp above the object, then the grasp pose)."""
+
+    def __init__(self, p0, R0, waypoints, v_max=0.05, w_max=0.2, hold=3.0, names=None):
+        self.segs, p, R, t = [], np.asarray(p0, float), np.asarray(R0, float), 0.0
+        for i, (pg, Rg) in enumerate(waypoints):
+            pg, Rg = np.asarray(pg, float), np.asarray(Rg, float)
+            rv = log_so3(Rg @ R.T)
+            T = max(2.0, np.linalg.norm(pg - p) / v_max, np.linalg.norm(rv) / w_max)
+            self.segs.append((t, T, p, R, pg, rv, (names or [])[i] if names and i < len(names) else f"wp{i}"))
+            p, R, t = pg, Rg, t + T
+        self.p_end, self.R_end = p, R
+        self.T_total = t + hold
+        self.center = p
+
+    def __call__(self, t):
+        for t0, T, pa, Ra, pb, rv, name in self.segs:
+            if t < t0 + T:
+                tau = (t - t0) / T
+                s = 10 * tau**3 - 15 * tau**4 + 6 * tau**5
+                ds = (30 * tau**2 - 60 * tau**3 + 30 * tau**4) / T
+                return Reference(pa + s * (pb - pa), ds * (pb - pa), exp_so3(s * rv) @ Ra, ds * rv, name)
+        done = t >= self.T_total
+        return Reference(self.p_end.copy(), np.zeros(3), self.R_end.copy(), np.zeros(3), "hold", done)
+
+    def sample_path(self, n=60):
+        return [self(t).p for t in np.linspace(0, self.T_total, n)]
+
+
+def goto_from_file(path, p0, R0, args):
+    """GotoReference from vgn_grasp_real's JSON (frame must be the WBC world = odom)."""
+    import json
+    f = Path(path).expanduser()
+    if not f.is_file():
+        raise SystemExit(f"[ABORT] grasp file {f} not found — run vgn_grasp_real (on the PC) first "
+                         f"and copy its ~/ros_logs/vgn_grasp.json to the robot")
+    g = json.loads(f.read_text())
+    w, x, y, z = g["quat_wxyz"]
+    R = np.array([[1 - 2 * (y * y + z * z), 2 * (x * y - z * w), 2 * (x * z + y * w)],
+                  [2 * (x * y + z * w), 1 - 2 * (x * x + z * z), 2 * (y * z - x * w)],
+                  [2 * (x * z - y * w), 2 * (y * z + x * w), 1 - 2 * (x * x + y * y)]])
+    pinch = np.asarray(g["pinch"], float) + np.array([0.0, 0.0, args.grasp_dz])
+    pre = pinch + np.array([0.0, 0.0, args.pregrasp])
+    print(f"  goto: {g.get('time', '')} score {g.get('score', 0):.2f}  pre-grasp {np.round(pre, 3)} -> "
+          f"grasp {np.round(pinch, 3)} ({g.get('frame', '?')})")
+    wps, names = [(pre, R)], ["pregrasp"]
+    if not args.pregrasp_only:
+        wps.append((pinch, R))
+        names.append("grasp")
+    return GotoReference(p0, R0, wps, v_max=args.goto_speed, hold=args.goto_hold, names=names)
+
+
+TASK_NAMES = ("ee", "pos", "ori", "base", "posture")
+
+
+def parse_priorities(spec):
+    """'ee,base,posture' -> [['ee'], ['base'], ['posture']]; '+' joins tasks on one level.
+    ee = pos + ori (6-D); posture is appended as the last level if it is missing."""
+    levels = [[n.strip() for n in lvl.split("+") if n.strip()] for lvl in spec.split(",") if lvl.strip()]
+    names = [n for lvl in levels for n in lvl]
+    bad = [n for n in names if n not in TASK_NAMES]
+    if bad:
+        raise SystemExit(f"[ERROR] --priorities: unknown task(s) {bad}; use {', '.join(TASK_NAMES)}")
+    if len(set(names)) != len(names):
+        raise SystemExit(f"[ERROR] --priorities: a task appears twice in '{spec}'")
+    if "ee" in names and ({"pos", "ori"} & set(names)):
+        raise SystemExit("[ERROR] --priorities: 'ee' already contains 'pos' and 'ori'")
+    if not ({"ee", "pos"} & set(names)):
+        raise SystemExit("[ERROR] --priorities: the EE position ('ee' or 'pos') must be a task")
+    if "posture" not in names:
+        levels.append(["posture"])   # without it the redundancy would be unresolved
+    return levels
+
+
 class WholeBodyController:
     def __init__(self, kin: WholeBodyKinematics, args, q_nom, yaw_nom):
         self.kin = kin
@@ -694,7 +809,9 @@ class WholeBodyController:
         self.yaw_nom = float(yaw_nom)
 
         self.W_t = np.diag([args.w_pos] * 3 + [args.w_ori] * 3)
-        self.W_u = np.diag([args.w_base_lin] * 2 + [args.w_base_yaw] + [args.w_arm] * 6)
+        wx = args.w_base_x if args.w_base_x is not None else args.w_base_lin
+        wy = args.w_base_y if args.w_base_y is not None else args.w_base_lin
+        self.W_u = np.diag([wx, wy, args.w_base_yaw] + [args.w_arm] * 6)
         self.sqrt_Wt = np.sqrt(self.W_t)
         self.sqrt_Wu = np.sqrt(self.W_u)
         self.W_u_inv = np.linalg.inv(self.W_u)
@@ -708,7 +825,9 @@ class WholeBodyController:
         if self.coll and not SCIPY_AVAILABLE:
             print("[WARN] collision avoidance needs scipy — disabled")
             self.coll = None
+        self.levels = parse_priorities(args.priorities)
         self.qp_failures = 0
+        self.level_skips = 0   # strict hierarchy: lower levels dropped (higher ones kept)
 
         if not SCIPY_AVAILABLE:
             print("[WARN] scipy not found -> falling back to damped pseudoinverse + clipping "
@@ -754,8 +873,11 @@ class WholeBodyController:
             N = np.eye(NU) - J_pinv_W @ J
             rows_A.append(self.sqrt_Wt @ J)
             rows_b.append(self.sqrt_Wt @ v_des)
+            A_ee, b_ee = self.sqrt_Wt @ J, self.sqrt_Wt @ v_des   # strict hierarchy tasks
+            T = {"ee": (A_ee, b_ee), "pos": (A_ee[:3], b_ee[:3]), "ori": (A_ee[3:], b_ee[3:])}
         else:
             e_p, e_o, N = np.zeros(3), np.zeros(3), np.eye(NU)
+            T = {}
 
         # ── Soft base-pose task (e.g. orbit around a table) ─────────────────
         if base_ref is not None:
@@ -767,6 +889,7 @@ class WholeBodyController:
             w = np.sqrt(self.a.w_base_task)
             rows_A.append(w * S)
             rows_b.append(w * u_b)
+            T["base"] = (w * S, w * u_b)
 
         # ── Posture, projected into the null space of the EE task ───────────
         u_post = np.zeros(NU)
@@ -776,23 +899,74 @@ class WholeBodyController:
         u_sec = N @ u_post
         rows_A.append(self.sqrt_Wu)
         rows_b.append(self.sqrt_Wu @ u_sec)
+        # strict hierarchy: posture is the last level, the equality constraints of the levels
+        # above replace the (unconstrained) null-space projector N
+        T["posture"] = (self.sqrt_Wu, self.sqrt_Wu @ u_post)
+        # levels in --priorities order; tasks joined with '+' share a level, absent tasks are skipped
+        tasks = []
+        for level in self.levels:
+            rows = [T[n] for n in level if n in T]
+            if rows:
+                tasks.append((np.vstack([r[0] for r in rows]), np.concatenate([r[1] for r in rows])))
 
-        # ── Constrained weighted QP ─────────────────────────────────────────
+        # ── Constrained QP: weighted (one solve) or strict hierarchy (one per level) ──
         A, b = np.vstack(rows_A), np.concatenate(rows_b)
         lb, ub = self._bounds(st, u_prev, dt)
         C, c, d_min, closest = (self.coll.constraints(st.base[2]) if self.coll
                                 else (np.zeros((0, NU)), np.zeros(0), np.inf, ""))
+        strict = self.a.hierarchy == "strict" and SCIPY_AVAILABLE
+        solve = ((lambda lo, hi: self._solve_hierarchy(tasks, lo, hi, C, c)) if strict
+                 else (lambda lo, hi: self._solve(A, b, lo, hi, C, c)))
         if not SCIPY_AVAILABLE:
             u = np.clip(np.linalg.lstsq(A, b, rcond=None)[0], lb, ub)
         else:
-            u = self._solve(A, b, lb, ub, C, c)
+            u = solve(lb, ub)
             if u is None:  # acceleration limits can make the collision constraints infeasible
-                u = self._solve(A, b, *self._bounds(st, u_prev, dt, acc_limits=False), C, c)
+                u = solve(*self._bounds(st, u_prev, dt, acc_limits=False))
             if u is None:  # u = 0 satisfies every constraint with d >= d_safe -> stop
                 self.qp_failures += 1
                 u = np.zeros(NU)
 
         return u, dict(p=p, R=R, e_p=e_p, e_o=e_o, d_min=d_min, closest=closest, n_coll=len(c))
+
+    def _solve_hierarchy(self, tasks, lb, ub, C, c):
+        """Strict task hierarchy (lexicographic least squares): level k minimises its own
+        residual subject to all constraints AND to every higher level keeping what it achieved
+        (|A_i u - A_i u_i| <= hqp_tol). A level that cannot be solved is skipped — the result
+        of the levels above it is kept, so a lower task can never degrade a higher one.
+        A tiny damping term (--damping) keeps each level unique near singularities."""
+        tol, lam = self.a.hqp_tol, np.sqrt(self.a.damping)
+        E, e, u = np.zeros((0, NU)), np.zeros(0), None
+        for k, (Ak, bk) in enumerate(tasks):
+            A_ = np.vstack([Ak, lam * np.eye(NU)])
+            b_ = np.concatenate([bk, np.zeros(NU)])
+            uk = (self._solve(A_, b_, lb, ub, C, c) if len(e) == 0
+                  else self._solve_eq(A_, b_, lb, ub, C, c, E, e, tol, u))
+            if uk is None:
+                if u is None:
+                    return None
+                self.level_skips += 1
+                break
+            u = uk
+            if k < len(tasks) - 1:  # fix what this level achieved for the levels below
+                E, e = np.vstack([E, Ak]), np.concatenate([e, Ak @ u])
+        return u
+
+    @staticmethod
+    def _solve_eq(A, b, lb, ub, C, c, E, e, tol, u0):
+        """min ||A u - b||^2  s.t.  lb <= u <= ub,  C u >= c,  |E u - e| <= tol  (SLSQP,
+        warm-started with the higher level's solution, which is feasible)."""
+        H, g = A.T @ A, A.T @ b
+        G = np.vstack([C, E, -E])
+        h = np.concatenate([c, e - tol, -e - tol])
+        res = minimize(lambda x: 0.5 * x @ H @ x - g @ x, u0, jac=lambda x: H @ x - g,
+                       bounds=list(zip(lb, ub)), method="SLSQP",
+                       constraints=[{"type": "ineq", "fun": lambda x: G @ x - h, "jac": lambda x: G}],
+                       options={"ftol": 1e-10, "maxiter": 50})
+        if res.success and np.all(res.x >= lb - 1e-6) and np.all(res.x <= ub + 1e-6) \
+                and np.all(G @ res.x >= h - 1e-5):
+            return res.x
+        return None
 
     @staticmethod
     def _solve(A, b, lb, ub, C, c):
@@ -1380,6 +1554,108 @@ def make_safety(backend, args, wait=3.0):
 # ══════════════════════════════════════════════════════════════════════════════
 # Control loop (backend-agnostic)
 # ══════════════════════════════════════════════════════════════════════════════
+def table_setup(args, st0):
+    """Figure-8 over the table: height from the table top, centre over its near half (horizontal
+    plane), EE never below the top. Returns False if the robot does not face the table."""
+    t = args.table_model
+    if args.goto_file or args.goto_table is not None:
+        args.min_ee_z = max(args.min_ee_z, t.top_z)   # the grasp / reach pose is near the top
+        return True
+    if args.cz is None:
+        args.cz = t.top_z + args.table_clearance
+    args.min_ee_z = max(args.min_ee_z, t.top_z + 0.02)
+    if args.plane != "horizontal":
+        return True
+    Rt = t.R()
+    hx, hy = 0.5 * t.size[0], 0.5 * t.size[1]
+    if args.table_position == "centre":
+        c = np.zeros(2)                                           # the table centre
+    else:                                                         # near half, facing the robot
+        b = Rt.T @ (st0.base[:2] - np.asarray(t.center))          # base in the table frame
+        if abs(b[0]) - hx < abs(b[1]) - hy:                       # robot at a long (y) side
+            s = np.sign(b[1]) or 1.0
+            c = np.array([np.clip(b[0], -hx + args.table_margin + args.amplitude,
+                                  hx - args.table_margin - args.amplitude), s * (hy - args.table_inset)])
+        else:                                                     # robot at an x side
+            s = np.sign(b[0]) or 1.0
+            c = np.array([s * (hx - args.table_inset),
+                          np.clip(b[1], -hy + args.table_margin + args.amplitude,
+                                  hy - args.table_margin - args.amplitude)])
+    args.center_xy = np.asarray(t.center) + Rt @ c
+    d = np.hypot(*(args.center_xy - st0.base[:2]))
+    print(f"  table: 8 centred {d:.2f} m from the base at z {args.cz:.2f} m "
+          f"(top {t.top_z:.2f} + {args.table_clearance:.2f})")
+    return True
+
+
+def table_fits(args, ref_gen):
+    """The whole 8 lies over the table top (minus --table_margin)."""
+    t = args.table_model
+    if args.plane != "horizontal":
+        return True
+    pts = np.array(ref_gen.sample_path(120))[:, :2]
+    loc = (pts - np.asarray(t.center)) @ t.R()
+    lim = np.array([0.5 * t.size[0], 0.5 * t.size[1]]) - args.table_margin
+    over = np.max(np.abs(loc) - lim)
+    if over > 0:
+        print(f"[ABORT] the figure-8 leaves the table top by {over * 100:.1f} cm — reduce "
+              f"amplitude:= or table_inset / table_margin")
+        return False
+    return True
+
+
+class RosViz:
+    """RViz markers while the WBC runs on ROS: the table model (/table_probe/markers, as table_probe)
+    and the planned EE path + current target (/wbc/markers), in the odom frame."""
+
+    def __init__(self, node, table, path, frame="odom"):
+        from rclpy.qos import DurabilityPolicy, QoSProfile
+        from visualization_msgs.msg import Marker, MarkerArray
+        self.M, self.MA, self.frame, self.table = Marker, MarkerArray, frame, table
+        q = QoSProfile(depth=1, durability=DurabilityPolicy.TRANSIENT_LOCAL)
+        self.pub_t = node.create_publisher(MarkerArray, "/table_probe/markers", q) if table is not None else None
+        self.pub_w = node.create_publisher(MarkerArray, "/wbc/markers", q)
+        self.path = [np.asarray(p, float) for p in path]
+
+    def _m(self, i, ns, kind, rgba):
+        m = self.M()
+        m.header.frame_id, m.ns, m.id, m.type = self.frame, ns, i, kind
+        m.pose.orientation.w = 1.0
+        m.color.r, m.color.g, m.color.b, m.color.a = (float(c) for c in rgba)
+        return m
+
+    def publish(self, target=None):
+        from geometry_msgs.msg import Point
+        t = self.table
+        if self.pub_t is not None:
+            ma = self.MA()
+            m = self._m(0, "table", self.M.CUBE, (0.6, 0.4, 0.2, 0.8))
+            m.pose.position.x, m.pose.position.y = (float(v) for v in t.center)
+            m.pose.position.z = float(t.top_z - t.thickness / 2)
+            m.pose.orientation.z, m.pose.orientation.w = float(np.sin(t.yaw / 2)), float(np.cos(t.yaw / 2))
+            m.scale.x, m.scale.y, m.scale.z = float(t.size[0]), float(t.size[1]), float(t.thickness)
+            ma.markers.append(m)
+            for i, (lx, ly, r) in enumerate(t.legs):
+                w = t.to_world([lx, ly])
+                m = self._m(1 + i, "table", self.M.CYLINDER, (0.8, 0.2, 0.2, 0.8))
+                m.pose.position.x, m.pose.position.y, m.pose.position.z = float(w[0]), float(w[1]), float(t.top_z / 2)
+                m.scale.x = m.scale.y = float(2 * r)
+                m.scale.z = float(t.top_z)
+                ma.markers.append(m)
+            self.pub_t.publish(ma)
+        ma = self.MA()
+        m = self._m(0, "wbc_path", self.M.LINE_STRIP, (0.1, 0.8, 0.1, 0.9))
+        m.scale.x = 0.006
+        m.points = [Point(x=float(p[0]), y=float(p[1]), z=float(p[2])) for p in self.path]
+        ma.markers.append(m)
+        if target is not None:
+            m = self._m(1, "wbc_target", self.M.SPHERE, (1.0, 0.5, 0.0, 0.9))
+            m.pose.position.x, m.pose.position.y, m.pose.position.z = (float(v) for v in target)
+            m.scale.x = m.scale.y = m.scale.z = 0.025
+            ma.markers.append(m)
+        self.pub_w.publish(ma)
+
+
 def run(backend: Backend, kin: WholeBodyKinematics, args):
     dt = 1.0 / args.rate
     st0 = backend.wait_for_state(args.wait_timeout)
@@ -1388,7 +1664,23 @@ def run(backend: Backend, kin: WholeBodyKinematics, args):
 
     kin.set_state(st0)
     p0, R0 = kin.ee_pose()
-    ref_gen = Figure8Reference.from_args(p0, R0, st0.base[2], args)
+    if getattr(args, "table_model", None) is not None and not table_setup(args, st0):
+        return 1
+    if args.goto_table is not None:
+        t = args.table_model
+        if t is None:
+            print("[ABORT] --goto_table needs --table")
+            return 1
+        goal = np.array([*t.center, t.top_z + args.goto_table])
+        R = rot_z(st0.base[2]) @ R_TOPDOWN
+        print(f"  goto: gripper point {args.goto_table:.2f} m above the table centre {np.round(goal, 3)}")
+        ref_gen = GotoReference(p0, R0, [(goal, R)], v_max=args.goto_speed, hold=args.goto_hold, names=["table"])
+    elif args.goto_file:
+        ref_gen = goto_from_file(args.goto_file, p0, R0, args)
+    else:
+        ref_gen = Figure8Reference.from_args(p0, R0, st0.base[2], args)
+        if getattr(args, "table_model", None) is not None and not table_fits(args, ref_gen):
+            return 1
     ctrl = WholeBodyController(kin, args, q_nom=st0.q, yaw_nom=st0.base[2])
     if isinstance(backend, MujocoSimBackend):
         backend.draw_reference(ref_gen.sample_path())
@@ -1401,11 +1693,21 @@ def run(backend: Backend, kin: WholeBodyKinematics, args):
     print(f"  plane={args.plane}  A={args.amplitude:.3f} m  omega={args.frequency:.3f} rad/s  "
           f"loops={args.loops}  duration={ref_gen.T_total:.1f} s")
     print(f"  limits: base {args.max_base_v} m/s, {args.max_base_w} rad/s | arm {args.max_arm_vel} rad/s"
-          f" | solver: {'BVLS box-QP' if SCIPY_AVAILABLE else 'pinv+clip'}\n")
+          f" | solver: {('strict hierarchy (' + ' > '.join('+'.join(l) for l in parse_priorities(args.priorities)) + ')' if args.hierarchy == 'strict' else 'weighted BVLS box-QP') if SCIPY_AVAILABLE else 'pinv+clip'}\n")
 
     u_prev = np.zeros(NU)
     rows = []
     safety = make_safety(backend, args)
+    ros_node = getattr(backend, "node", None) or getattr(getattr(backend, "ros", None), "node", None)
+    viz = None
+    if ros_node is not None:   # table + planned path in RViz (Fixed Frame odom)
+        try:
+            viz = RosViz(ros_node, getattr(args, "table_model", None), ref_gen.sample_path(120))
+            viz.publish()
+        except Exception as e:  # visualisation must never stop the controller
+            print(f"  [viz] RViz markers disabled: {e}")
+            viz = None
+    next_viz = 0.0
     t0 = backend.now()
     next_print = 0.0
     status = 0
@@ -1455,6 +1757,12 @@ def run(backend: Backend, kin: WholeBodyKinematics, args):
 
             rows.append([t, *ref.p, *info["p"], err, np.linalg.norm(info["e_o"]),
                          *u, *st.base, *st.q, solve_ms, info["d_min"]])
+            if viz is not None and t >= next_viz:
+                next_viz = t + 0.5
+                try:
+                    viz.publish(ref.p)
+                except Exception:
+                    viz = None
             if t >= next_print:
                 next_print += 0.5
                 clr = f"clr={info['d_min'] * 100:4.1f}cm " if np.isfinite(info["d_min"]) else ""
@@ -1523,8 +1831,34 @@ def build_arg_parser(description="Steve figure-8 unified velocity-level WBC (MuJ
     g.add_argument("--loops", type=int, default=3)
     g.add_argument("--ramp_time", type=float, default=3.0, help="speed ramp in/out [s]")
     g.add_argument("--cz", type=float, default=None, help="figure-8 centre height [m] (default: start EE)")
-    g.add_argument("--orientation", choices=["hold", "forward"], default="hold",
-                   help="hold start EE orientation, or turn wrist to point along base +X")
+    g.add_argument("--orientation", choices=["hold", "forward", "down"], default="hold",
+                   help="hold start EE orientation, turn the wrist to point along base +X, or "
+                        "point the gripper down (drawing on a table)")
+    g.add_argument("--table", default=None,
+                   help="table model (config/tables/<name>.yaml or a path): collision model for arm "
+                        "and base; with --plane horizontal the 8 is centred over the table's near half "
+                        "at top_z + --table_clearance and must fit on the top")
+    g.add_argument("--table_clearance", type=float, default=0.10,
+                   help="height of the 8 (gripper tip / EE point) above the table top [m]")
+    g.add_argument("--table_position", choices=["centre", "near"], default="centre",
+                   help="horizontal 8 over the table centre (default), or over its near half "
+                        "(--table_inset from the edge facing the robot; less reach needed)")
+    g.add_argument("--table_inset", type=float, default=0.25,
+                   help="figure-8 centre this far inside the table's near edge [m]")
+    g.add_argument("--goto_table", type=float, default=None, metavar="HEIGHT",
+                   help="instead of a figure-8: move the gripper point HEIGHT m above the table centre, "
+                        "pointing down (needs --table); the base moves as needed")
+    g.add_argument("--goto_file", default=None,
+                   help="instead of a figure-8: go to the grasp in this JSON (vgn_grasp_real), first "
+                        "the pre-grasp above it, then the grasp pose, then hold")
+    g.add_argument("--pregrasp", type=float, default=0.10, help="pre-grasp height above the grasp [m]")
+    g.add_argument("--pregrasp_only", action="store_true", help="stop at the pre-grasp")
+    g.add_argument("--grasp_dz", type=float, default=0.0,
+                   help="shift the grasp point up (+) / down (-) [m], e.g. without a gripper mounted")
+    g.add_argument("--goto_speed", type=float, default=0.05, help="max EE speed for --goto_file [m/s]")
+    g.add_argument("--goto_hold", type=float, default=3.0, help="hold the grasp pose this long [s]")
+    g.add_argument("--table_margin", type=float, default=0.05,
+                   help="the 8 must stay this far inside the table top outline [m]")
 
     g = p.add_argument_group("controller")
     g.add_argument("--rate", type=float, default=50.0, help="control rate [Hz]")
@@ -1535,9 +1869,25 @@ def build_arg_parser(description="Steve figure-8 unified velocity-level WBC (MuJ
     g.add_argument("--w_ori", type=float, default=300.0, help="task weight, EE orientation")
     g.add_argument("--w_base_lin", type=float, default=1.0, help="effort weight, base translation")
     g.add_argument("--w_base_yaw", type=float, default=5.0, help="effort weight, base rotation")
+    g.add_argument("--w_base_x", type=float, default=None,
+                   help="effort weight, base forward (base frame); default --w_base_lin")
+    g.add_argument("--w_base_y", type=float, default=None,
+                   help="effort weight, base sideways (base frame); default --w_base_lin")
     g.add_argument("--w_arm", type=float, default=1.0, help="effort weight, arm joints")
     g.add_argument("--k_posture", type=float, default=1.0, help="null-space posture gain [1/s]")
     g.add_argument("--damping", type=float, default=1e-3, help="damping of null-space projector")
+    g.add_argument("--hierarchy", choices=["weighted", "strict"], default="strict",
+                   help="weighted: one QP, tasks traded off by their weights | strict: one QP per "
+                        "priority level (EE pose > base pose > posture), lower levels act only in "
+                        "the constrained null space of the higher ones")
+    g.add_argument("--priorities", default="ee,base,posture",
+                   help="strict hierarchy: task order, highest first; ',' separates levels, '+' puts "
+                        "tasks on the same level (traded off by their weights). Tasks: ee (= pos+ori), "
+                        "pos, ori, base (only when a base path is set), posture. Examples: "
+                        "'pos,ori,posture'  'base,ee,posture'  'pos,ori+posture'")
+    g.add_argument("--hqp_tol", type=float, default=1e-3,
+                   help="strict hierarchy: slack with which a lower level must keep a higher "
+                        "level's (weighted) task value")
     g.add_argument("--w_base_task", type=float, default=50.0, help="weight of soft base-pose task")
     g.add_argument("--k_base", type=float, default=2.0, help="base-pose task gain [1/s]")
     g.add_argument("--lock_yaw", action="store_true", help="forbid base rotation")
@@ -1552,6 +1902,9 @@ def build_arg_parser(description="Steve figure-8 unified velocity-level WBC (MuJ
     g.add_argument("--d_safe", type=float, default=0.02, help="minimum allowed distance [m]")
     g.add_argument("--d_influence", type=float, default=0.10, help="constraints active below [m]")
     g.add_argument("--xi", type=float, default=0.30, help="max approach speed at d_influence [m/s]")
+    g.add_argument("--d_safe_top", type=float, default=0.03,
+                   help="cabinet / arm mount vs obstacles above the base (a table top) [m]; the base "
+                        "body keeps --d_safe_base from everything at its height (legs, walls)")
     g.add_argument("--d_safe_base", type=float, default=0.15,
                    help="minimum distance base footprint <-> environment [m] (LiDAR safety field; never relaxed)")
     g.add_argument("--d_influence_base", type=float, default=0.45,
@@ -1610,9 +1963,9 @@ def build_arg_parser(description="Steve figure-8 unified velocity-level WBC (MuJ
                    help="low-pass time constant of the arm command [s] (0 = off; ~0.06 against joint buzzing)")
     g.add_argument("--max_cmd_lead", type=float, default=0.2,
                    help="max lead of the streamed arm setpoint over the measured joints [rad]")
-    g.add_argument("--pan_offset", type=float, default=-np.pi / 2,
+    g.add_argument("--pan_offset", type=float, default=np.pi / 2,
                    help="q_model = q_ros + offset on shoulder_pan [rad]: the URDF mounts the UR5e "
-                        "with yaw -90 deg on the cabinet (Gazebo + real robot), the MJCF with 0")
+                        "with yaw +90 deg on the cabinet (Gazebo + real robot), the MJCF with 0")
     g.add_argument("--base_feedback", choices=["odom", "open_loop"], default="odom")
     g.add_argument("--state_timeout", type=float, default=0.25, help="max age of feedback [s]")
     g.add_argument("--wait_timeout", type=float, default=10.0,
@@ -1651,7 +2004,16 @@ def main(argv=None):
     dt = 1.0 / args.rate
     model_path = resolve_model(args.model)
     print(f"Model: {model_path}")
-    model = load_model(model_path, intruder=args.sim_intruder is not None)
+    args.table_model = TableModel.load(args.table) if args.table else None
+    if args.table_model is not None:
+        t = args.table_model
+        if t.frame not in ("odom", "world"):
+            sys.exit(f"[ERROR] table '{args.table}' is in frame '{t.frame}'; the WBC needs odom")
+        args.collision_env = "model"   # the table is the (only) static obstacle of the model
+        print(f"Table: {t.name}  centre {np.round(t.center, 3)} ({t.frame})  size {np.round(t.size, 2)} m  "
+              f"top {t.top_z:.2f} m  {len(t.legs)} legs")
+    model = load_model(model_path, intruder=args.sim_intruder is not None,
+                       spec_edit=args.table_model.apply_to_spec if args.table_model is not None else None)
     kin = WholeBodyKinematics(model)
 
     if args.mode == "sim":
