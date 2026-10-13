@@ -29,6 +29,8 @@
   <exec_depend>steve_simulation</exec_depend>
   <exec_depend>steve_navigation</exec_depend>
   <exec_depend>steve_manipulation</exec_depend>
+  <!-- VGN grasp detection (bridge, worker, weights) -->
+  <exec_depend>steve_perception</exec_depend>
   <exec_depend>controller_manager_msgs</exec_depend>
 
   <test_depend>ament_copyright</test_depend>

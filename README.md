@@ -66,7 +66,8 @@ the real robot.
   its path (transit height) and the arm keeps ≥ 2 cm from them (hard constraints, not relaxed in
   the final descent). Any robot–obstacle contact fails the run.
 * **VGN** (MuJoCo): TSDF views + inference in the `vgn_env` conda env (run isolated from
-  `~/.local` and the ROS `PYTHONPATH`); only grasps **on the target** are used (within its size
+  `~/.local` and the ROS `PYTHONPATH`); VGN itself (bridge, worker, weights) lives in
+  `steve_perception.vgn` — see its README for the `vgn_env` setup. Only grasps **on the target** are used (within its size
   of the tracked position). Three timing modes, `--vgn_mode` / separate launch files:
 
   | Mode | Launch file | Views | Inference | Robot waits |

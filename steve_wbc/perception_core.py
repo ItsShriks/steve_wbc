@@ -8,6 +8,7 @@ Stateless perception helpers for the MMO-700 camera pipeline.
   detect_red_object(rgb, cfg)                  → (found, cx, cy, mask)
   pixel_to_bearing(cx, cy, fovy, img_w, img_h) → (h_angle, v_angle)  [rad]
   unproject_pixel_to_world(model, data, ...)   → (pt_world, raw_depth)
+  read_lidar(model, data, sensor_name)         → distance [m] (+inf = no obstacle)
 
 All simulation stepping is the caller's responsibility.
 """
@@ -185,3 +186,21 @@ def unproject_pixel_to_world(
     cam_mat = data.cam_xmat[cam_id].reshape(3, 3)
     pt_world = cam_pos + cam_mat @ np.array([x_cam, y_cam, z_cam])
     return pt_world, d
+
+
+def read_lidar(
+    model: mujoco.MjModel,
+    data: mujoco.MjData,
+    sensor_name: str,
+) -> float:
+    """
+    Read a MuJoCo rangefinder sensor by name.
+    Returns distance in metres, or +inf when no intersection detected
+    (MuJoCo reports -1 for out-of-range).
+    """
+    sid = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_SENSOR, sensor_name)
+    if sid < 0:
+        return float("inf")
+    adr = model.sensor_adr[sid]
+    val = float(data.sensordata[adr])
+    return val if val > 0.0 else float("inf")

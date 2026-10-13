@@ -11,7 +11,7 @@ Compare the VGN timing modes of active_perception_wbc in headless MuJoCo.
 
 Runs are sequential on purpose: the measured VGN inference time is charged to simulation
 time, so parallel runs competing for the CPU/GPU would distort the comparison.
-Needs the vgn_env conda environment (see vgn_mujoco_bridge.py).
+Needs the vgn_env conda environment (see steve_perception/steve_perception/vgn/README.md).
 """
 
 import argparse

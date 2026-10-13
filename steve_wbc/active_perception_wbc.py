@@ -56,6 +56,7 @@ Run
 
 import sys
 import time
+from pathlib import Path
 
 import mujoco
 import numpy as np
@@ -68,8 +69,7 @@ try:
         make_safety, orientation_error, parse_args, resolve_model, rot_z, summarize, wrap_angle,
     )
     from steve_wbc.perception_core import (IMG_H, IMG_W, PerceptionConfig, detect_red_object,
-                                           render_rgbd, unproject_pixel_to_world)
-    from steve_wbc.vgn_mujoco_bridge import VGNBridge, read_lidar
+                                           read_lidar, render_rgbd, unproject_pixel_to_world)
     from steve_wbc.target_profile import TargetProfile
     from steve_wbc.table_model import TableModel
 except ImportError:  # plain script next to the other modules (e.g. macOS without ROS)
@@ -79,10 +79,15 @@ except ImportError:  # plain script next to the other modules (e.g. macOS withou
         make_safety, orientation_error, parse_args, resolve_model, rot_z, summarize, wrap_angle,
     )
     from perception_core import (IMG_H, IMG_W, PerceptionConfig, detect_red_object,
-                                 render_rgbd, unproject_pixel_to_world)
-    from vgn_mujoco_bridge import VGNBridge, read_lidar
+                                 read_lidar, render_rgbd, unproject_pixel_to_world)
     from target_profile import TargetProfile
     from table_model import TableModel
+
+try:
+    from steve_perception.vgn import VGNBridge
+except ImportError:  # steve_perception not built (e.g. plain script): use the source-tree sibling
+    sys.path.insert(0, str(Path(__file__).resolve().parents[2] / "steve_perception"))
+    from steve_perception.vgn import VGNBridge
 
 # ── Arm poses ────────────────────────────────────────────────────────────────
 DRIVE_POSE = [0.0, -1.5708, 1.5708, -1.5708, -1.5708, 0.0]   # retracted for driving

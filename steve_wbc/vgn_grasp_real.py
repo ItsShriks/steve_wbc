@@ -33,10 +33,14 @@ import numpy as np
 
 try:
     from steve_wbc.table_model import TableModel, lidar_clusters
-    from steve_wbc.vgn_mujoco_bridge import VGNBridge
 except ImportError:
     from table_model import TableModel, lidar_clusters
-    from vgn_mujoco_bridge import VGNBridge
+
+try:
+    from steve_perception.vgn import VGNBridge
+except ImportError:  # steve_perception not built (e.g. plain script): use the source-tree sibling
+    sys.path.insert(0, str(Path(__file__).resolve().parents[2] / "steve_perception"))
+    from steve_perception.vgn import VGNBridge
 
 R_TOPDOWN = np.array([[1, 0, 0], [0, -1, 0], [0, 0, -1]], dtype=float)
 
