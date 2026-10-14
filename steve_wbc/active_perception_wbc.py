@@ -150,7 +150,15 @@ REPOSITION_SPEED = 0.25       # m/s along the ring
 VIEW_TIMEOUT = 3.0            # s  real camera: no depth frame + TF for a VGN view -> skip the view
 NO_GRASP = "no grasp candidate found"
 GOTO_DONE = "reached grasp pose"   # --goto_grasp_only
-QUADRANT_SIDE = {"bottom-left": "here", "bottom-right": "here", "top-left": "left", "top-right": "right"}
+MPC_LEASH = 0.04              # m    EE reference at most this far ahead of the real EE
+MPC_LEASH_ANG = 0.25          # rad  ... and this much rotation ahead
+LEASHED_STATES = ("PRE_GRASP", "RETREAT")   # free-space moves; never near the object (contact detection)
+AT_GRASP_PUSHED = 0.03        # m  --goto_grasp_only: EE pushed this far off the grasp pose -> back up
+# table region of the object (seen from the side the robot arrives on) -> side to grasp from:
+# near half -> stay; far half by thirds: left -> the robot's left side, right -> its right side,
+# centre -> the opposite (back) side
+QUADRANT_SIDE = {"bottom-left": "here", "bottom-right": "here", "top-left": "left", "top-center": "back",
+                 "top-right": "right"}
 REACH_TOL = 0.01              # m  IK residual accepted as reachable
 GRASP_YAWS = (0.0, np.pi / 2)  # top-down grasp rotations tried (fingers open along y / along x)
 SIDES = {  # outward normal of the table side, base yaw facing the table
@@ -593,6 +601,8 @@ class RosWorld(VGNInference):
                 R = np.array([[1 - 2 * (y * y + z * z), 2 * (x * y - z * w)],
                               [2 * (x * y + z * w), 1 - 2 * (x * x + z * z)]])
                 self._scan_T = (R, np.array([t.x, t.y]))
+                if self.vgn is None:  # TF no longer needed: stop the robot's ~500 Hz /tf stream here
+                    self._tf_listener.unregister()
                 self.log.info(f"LiDAR {msg.header.frame_id} -> base_link found: distances are measured "
                               f"straight ahead in a {2 * self.a.lidar_corridor:.2f} m wide corridor")
             except Exception:  # TF not up yet: sector around the scan's 0° as before
@@ -660,17 +670,34 @@ class RosWorld(VGNInference):
 # ══════════════════════════════════════════════════════════════════════════════
 # Task-level state machine on top of the WBC
 # ══════════════════════════════════════════════════════════════════════════════
+def grasp_for_heading(R, yaw):
+    """Of the two equivalent top-down grasps of a parallel gripper (R and R turned 180 deg about the
+    vertical), the one closer to the base heading's natural wrist pose (rot_z(yaw) @ R_TOPDOWN) —
+    else, e.g. from the table's back side, wrist 3 must turn ~180 deg and the WBC compensates by
+    sliding and turning the base."""
+    ref = rot_z(yaw) @ R_TOPDOWN
+    R2 = rot_z(np.pi) @ R
+    return R if np.trace(ref.T @ R) >= np.trace(ref.T @ R2) else R2
+
+
 def table_quadrant(xy, lo, hi, arrival_side):
-    """Quadrant of the table that point xy lies in, seen from `arrival_side` (the side the robot
-    came from), and the table side to grasp from (QUADRANT_SIDE). Returns (quadrant, side)."""
+    """Region of the table that point xy lies in, seen from `arrival_side` (the side the robot
+    came from), and the table side to grasp from (QUADRANT_SIDE): near (bottom) half -> stay; far
+    (top) half split in thirds across: left / right -> that side, centre -> the opposite side.
+    Returns (region, side)."""
     n_out = SIDES[arrival_side][0]                 # outward normal of the robot's side
     into = -n_out                                  # from the robot into the table
     left = np.array([-into[1], into[0]])           # the robot's left, facing the table
     d = np.asarray(xy, float)[:2] - 0.5 * (np.asarray(lo) + np.asarray(hi))
-    quad = f"{'top' if d @ into > 0 else 'bottom'}-{'left' if d @ left > 0 else 'right'}"
+    width = abs((np.asarray(hi) - np.asarray(lo)) @ left)      # table extent across
+    across = d @ left
+    if d @ into <= 0:
+        quad = f"bottom-{'left' if across > 0 else 'right'}"
+    else:
+        quad = f"top-{'left' if across > width / 6 else 'right' if across < -width / 6 else 'center'}"
     pref = QUADRANT_SIDE[quad]
-    if pref in ("left", "right"):                  # robot-relative -> table side (front/back/left/right)
-        want = left if pref == "left" else -left
+    if pref in ("left", "right", "back"):          # robot-relative -> table side (front/back/left/right)
+        want = {"left": left, "right": -left, "back": into}[pref]
         pref = max(SIDES, key=lambda s: SIDES[s][0] @ want)
     else:
         pref = arrival_side
@@ -787,6 +814,20 @@ class InterceptionMPC:
         rstep = rv if ang <= EE_ROT_SPEED * dt else rv * (EE_ROT_SPEED * dt / ang)
         self.R = exp_so3(rstep) @ self.R
         return Reference(self.p.copy(), self.v.copy(), self.R.copy(), rstep / dt, "mpc")
+
+    def leash(self, p_ee, R_ee, max_lead=MPC_LEASH, max_ang=MPC_LEASH_ANG):
+        """Reference governor: the reference never runs more than max_lead [m] / max_ang [rad] ahead
+        of the real EE. Else a slow arm (low speed limits, a late control loop, a large wrist
+        rotation) falls behind until the tracking error looks like a blocked gripper; real blocks
+        still end in the pre-grasp timeout / the descent's stuck check."""
+        d = self.p - p_ee
+        n = np.linalg.norm(d)
+        if n > max_lead:
+            self.p = p_ee + d * (max_lead / n)
+        rv = log_so3(self.R @ R_ee.T)
+        ang = np.linalg.norm(rv)
+        if ang > max_ang:
+            self.R = exp_so3(rv * (max_ang / ang)) @ R_ee
 
 
 class TableOrbit:
@@ -949,6 +990,8 @@ class ActivePerceptionWBC:
             self.n_seen[cam] = self.n_seen.get(cam, 0) + 1
 
     def _mpc(self, offset, goal_R, a_max, v_max, obj_moves=True):
+        if self.state in LEASHED_STATES:  # free-space moves only: near the object a blocked arm
+            self.mpc.leash(self.ee, self.R_ee)  # must show up as tracking error (stop / replan)
         obj = self.tracker.predict(self.t)
         return self.mpc.step(obj, self.tracker.v if obj_moves else np.zeros(3), np.asarray(offset, float),
                              goal_R, a_max, v_max, self.dt)
@@ -1137,7 +1180,8 @@ class ActivePerceptionWBC:
                 ref = self._mpc(up, self.grasp_R, a_max=0.3, v_max=EE_DESCEND_SPEED)
                 if np.linalg.norm(self.ee - (obj + up)) < 0.015 or ts > 6.0:
                     e = np.array(self.at_grasp_err or [np.nan])
-                    self.result = GOTO_DONE
+                    if self.result != "contact at the grasp pose":
+                        self.result = GOTO_DONE
                     self._enter("DONE", f"back at the pre-grasp height | during {a.hold_time:.1f} s at the grasp pose "
                                         f"the EE was {np.nanmean(e) * 100:.1f} cm (mean), {np.nanmax(e) * 100:.1f} cm "
                                         "(max) from the grasp point")
@@ -1162,7 +1206,12 @@ class ActivePerceptionWBC:
                                 + (" (limited by table clearance)" if stuck else ""))
             elif self.state == "AT_GRASP":
                 self.at_grasp_err.append(float(np.linalg.norm(self.ee - goal)))
-                if ts >= max(a.hold_time, 0.5):
+                if ts > 0.5 and self.at_grasp_err[-1] > AT_GRASP_PUSHED:   # contact (something unseen)
+                    a.d_safe = self.d_safe
+                    self.result = "contact at the grasp pose"
+                    self._enter("RETREAT", f"EE pushed {self.at_grasp_err[-1] * 100:.1f} cm off the grasp pose — "
+                                           "contact with something the robot does not know? -> backing up")
+                elif ts >= max(a.hold_time, 0.5):
                     a.d_safe = self.d_safe
                     self._enter("RETREAT", f"margin -> {self.d_safe * 100:.1f} cm, back up to the pre-grasp height")
             elif ts >= GRASP_TIME:
@@ -1391,7 +1440,8 @@ class ActivePerceptionWBC:
         if not late and self.a.vgn_orientation == "yaw":
             # keep top-down approach, rotate about z to VGN's finger axis (assumed VGN y-axis)
             ax = rot[:, 1]
-            self.grasp_R = rot_z(np.arctan2(ax[1], ax[0]) - np.pi / 2) @ R_TOPDOWN
+            self.grasp_R = grasp_for_heading(rot_z(np.arctan2(ax[1], ax[0]) - np.pi / 2) @ R_TOPDOWN,
+                                             self.base_hold[2])
 
     def _explore(self, st, why):
         """VGN found no grasp from this side: drive around the table to the next side (the views
@@ -1513,8 +1563,12 @@ class ActivePerceptionWBC:
         if self.arrival_side is None:
             self.arrival_side = here   # quadrants stay fixed to the side the robot came from
         quad, preferred = table_quadrant(obj[:2], lo, hi, self.arrival_side)
-        print(f"  object in the {quad.upper()} quadrant of the table (seen from the "
-              f"{self.arrival_side} side) -> grasp from here ({here}) if reachable, else the {preferred} side")
+        moving = bool(np.any(self.tracker.v))
+        if moving:  # it rolls on while the robot drives around: intercept from here if reachable
+            preferred = here
+        print(f"  object in the {quad.upper()} part of the table (seen from the {self.arrival_side} side) -> "
+              + ("moving: intercept from here if reachable" if moving
+                 else f"grasp from here ({here})" if preferred == here else f"grasp from the {preferred} side"))
         cands = []
         for name, (n, yaw) in SIDES.items():
             if name in self.bad_sides:
@@ -1534,14 +1588,14 @@ class ActivePerceptionWBC:
             cands.append((length, name, goal, path, o))
         report, chosen = [], None
         R0 = self.grasp_R.copy()
-        # stay where the robot is if the grasp is reachable from here; else the quadrant's side, then
-        # the others by path length (sides where VGN found no grasp are not candidates)
-        for cost, name, pose, path, o in sorted(cands, key=lambda c: (c[1] != here, c[1] != preferred, c[0])):
+        # the side of the object's table region first (near half: stay); the others (here first, then
+        # by path length) only if it is not reachable; sides where VGN found no grasp are not candidates
+        for cost, name, pose, path, o in sorted(cands, key=lambda c: (c[1] != preferred, c[0])):
             if np.any(o[:2] < lo + 0.03) or np.any(o[:2] > hi - 0.03):
                 report.append(f"{name}: object off the table by then")
                 continue
             for yaw in GRASP_YAWS:  # rotate the grasp so the open fingers clear the obstacles
-                self.grasp_R = rot_z(yaw) @ R0
+                self.grasp_R = grasp_for_heading(rot_z(yaw) @ R0, pose[2])
                 res = self._reach_residual(pose, self._approach_points(pose, o))
                 report.append(f"{name}{'(here)' if not path else ''}/{np.degrees(yaw):.0f}°: "
                               + (f"collision ({self._reach_block})" if not np.isfinite(res)
@@ -1551,7 +1605,7 @@ class ActivePerceptionWBC:
                     break
             if chosen:
                 break
-        self.grasp_R = rot_z(chosen["yaw"]) @ R0 if chosen else R0
+        self.grasp_R = grasp_for_heading(rot_z(chosen["yaw"]) @ R0, chosen["pose"][2]) if chosen else R0
         self.kin.set_state(st)
         print(f"  approach planning (IK residual per side): {', '.join(report)}"
               f" -> {chosen['side'] if chosen else 'none reachable'}")
@@ -1630,6 +1684,7 @@ class ActivePerceptionWBC:
                 self.t = self.b.now() - self.t0
                 self.kin.set_state(st)
                 self.ee, R_ee = self.kin.ee_pose()
+                self.R_ee = R_ee
                 if self.mpc is None and self.state == "PRE_GRASP":
                     self.mpc = InterceptionMPC(self.ee, R_ee)
                     obj = self.tracker.predict(self.t)

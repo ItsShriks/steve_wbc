@@ -58,12 +58,16 @@ the real robot.
   moving with it, descends and grasps; during descent, grasp and lift the base holds still (soft).
 * **Hold check**: after the lift the object is held for `--hold_time` (3 s); success only if it
   is still in the gripper (catches slipping grasps).
-* **Approach side**: the robot **stays on the side it is on whenever the whole grasp (pre-grasp,
-  grasp, lift) is reachable from there** (IK + collision check with the base at the stand-off).
-  Only if not does it drive around the table: first to the side the object's quadrant points to
-  (table split into four quadrants seen from the arrival side; far half → left / right side,
-  `QUADRANT_SIDE`), then the others by path length. A blocked or stalled grasp, or VGN finding no
-  grasp, replans to another side.
+* **Approach side by the object's place on the table** (seen from the side the robot arrives on,
+  `QUADRANT_SIDE`): **near (bottom) half → no repositioning**, grasp from where it is; far (top)
+  half split in thirds across: **left → the robot's left side, right → its right side, centre →
+  the opposite (back) side** — for a static object; a moving one is intercepted from where the robot
+  is if reachable (it would roll on while the robot drives around). The choice is verified by IK +
+  collision checks; only if that side
+  cannot reach the grasp are the others tried (here first, then by path length). A blocked or
+  stalled grasp, or VGN finding no grasp, replans to another side. Of the two equivalent top-down
+  grasps of the parallel gripper (180° apart) the one that suits the base heading on that side is
+  used (from the back side the wrist would otherwise turn 180° and the WBC slid the base).
 * **Driving around the table** (`TableOrbit`): one smooth path, not corner-to-corner — a ring at a
   distance on which the base clears the table at any heading, with straight sides joined by
   circular arcs, blended smoothly from the start's distance onto the ring and down to the goal's
@@ -152,7 +156,7 @@ FASTRTPS_DEFAULT_PROFILES_FILE=~/.ros/fastdds_steve.xml` — the PC profile must
 | Table (after every bringup restart: `odom` resets) | robot 0.3–1.5 m in front of the table: `ros2 run steve_wbc table_probe --name lab_table --lidar_only --top_z 0.827` | `config/tables/lab_table.yaml` (odom) |
 | Detector check | `ros2 run steve_wbc red_ball_detector --ros-args -p target:=my_ball -p topic_style:=realsense -p "cameras:=[gripper_camera]" -p "head_topic:=''"` | `/steve_perception/target_point` (odom) |
 | Dry run (robot does not move) | `ros2 launch steve_wbc active_perception_wbc.launch.py use_sim_time:=false launch_bringup:=false dry_run:=true table:=lab_table target:=my_ball detector_cameras:=gripper_camera vgn:=false goto_grasp_only:=true extra_args:="--camera_tilt 25"` | `... → AT_GRASP → RETREAT → DONE`, `reached grasp pose` |
-| Real run (robot ~1 m back, arm `home`) | the same without `dry_run:=true`, `extra_args:="--camera_tilt 25 --max_base_v 0.10 --max_arm_vel 0.3 --grasp_dz 0.05"` | drives up, finds the ball, hovers 5 cm above the grasp pose, backs up |
+| Real run (robot ~1 m back, arm `home`) | the same without `dry_run:=true`, `extra_args:="--camera_tilt 25 --max_base_v 0.10 --max_arm_vel 0.3 --grasp_dz 0.05 --state_timeout 0.5"` (`--state_timeout 0.5`: Wi-Fi) | drives up, finds the ball, hovers 5 cm above the grasp pose, backs up |
 
 Then `vgn:=true` (VGN views from the gripper camera, levelled on the table plane; no grasp → other
 sides, see above) and a slowly rolling ball. Without a gripper keep `--grasp_dz` ≥ 0.05: at the true

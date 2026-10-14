@@ -237,9 +237,10 @@ def main(argv=None):
     if st["K"] is None or not st["depth"]:
         sys.exit(f"[ERROR] no depth / camera_info on {a.camera} within {a.timeout:.0f} s")
     K, cam_frame = st["K"], st["depth"][0][1]
+    t0 = time.monotonic()   # the robot's TF needs a few seconds over the network
+    while not tf.can_transform(a.frame, cam_frame, Time()) and time.monotonic() - t0 < a.timeout:
+        rclpy.spin_once(n, timeout_sec=0.05)
     try:
-        for _ in range(20):
-            rclpy.spin_once(n, timeout_sec=0.05)
         tr = tf.lookup_transform(a.frame, cam_frame, Time())
     except Exception as e:
         sys.exit(f"[ERROR] no TF {a.frame} <- {cam_frame}: {e}\n        gripper camera: the mount TF comes from "

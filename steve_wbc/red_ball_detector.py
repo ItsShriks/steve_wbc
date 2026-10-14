@@ -54,6 +54,25 @@ TOPIC_STYLES = {
 R_OPT_TO_XFWD = np.array([[0.0, 0.0, 1.0], [-1.0, 0.0, 0.0], [0.0, -1.0, 0.0]])
 
 
+def sphere_center(depth, mask, K, r, zmin, zmax, erode_px=3, max_sd=0.006):
+    """Centre (camera frame) of a sphere of radius r from the depth of its blob without the rim
+    (eroded by erode_px), by least squares on |p - c| = r; None if too few points or a bad fit."""
+    import cv2
+    from scipy.optimize import least_squares
+    core = cv2.erode(mask.astype(np.uint8), np.ones((2 * erode_px + 1, 2 * erode_px + 1), np.uint8)) > 0
+    ys, xs = np.nonzero(core)
+    z = depth[ys, xs]
+    ok = np.isfinite(z) & (z > zmin) & (z < zmax)
+    if ok.sum() < 30:
+        return None
+    P = np.stack([(xs[ok] - K[0, 2]) * z[ok] / K[0, 0], (ys[ok] - K[1, 2]) * z[ok] / K[1, 1], z[ok]], 1)
+    P = P[P[:, 2] < np.percentile(P[:, 2], 5) + 2.5 * r]       # drop remaining points behind the ball
+    m = np.median(P, axis=0)
+    res = least_squares(lambda c: np.linalg.norm(P - c, axis=1) - r, m + r * m / np.linalg.norm(m),
+                        loss="soft_l1", f_scale=0.003)
+    return res.x if np.std(res.fun) < max_sd else None
+
+
 def quat_to_mat(q):
     x, y, z, w = q.x, q.y, q.z, q.w
     return np.array([
@@ -181,6 +200,12 @@ class RedBallDetector(Node):
         top = self.target.center_from_points(pts @ R.T + tr)
         if top is not None:
             p = top
+        if self.target.shape == "sphere":
+            # sphere fit (known radius) to the depth points of the ball without its rim: at the rim the
+            # RealSense mixes ball and background depth ("flying pixels"), which lift the top estimate
+            c_sph = sphere_center(depth, mask, K, self.radius, self.min_range, self.max_range)
+            if c_sph is not None:
+                p = R @ (R_OPT_TO_XFWD @ c_sph if c["conv"] == "x_forward" else c_sph) + tr
 
         out = PointStamped()
         out.header.stamp = rgb_msg.header.stamp

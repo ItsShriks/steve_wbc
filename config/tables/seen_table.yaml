@@ -1,0 +1,15 @@
+# Table 'seen_table' — see steve_wbc/table_model.py (table_probe writes these)
+name: seen_table
+frame: odom
+center:
+- 1.5753
+- -1.2435
+yaw: 0.1425
+size:
+- 0.4228
+- 0.2726
+top_z: 0.8257
+thickness: 0.03
+legs: []
+skirt: 0.0
+notes: 'vgn_grasp_real: visible part of the top plate, 2026-10-14 18:37'
