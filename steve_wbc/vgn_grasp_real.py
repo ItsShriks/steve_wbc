@@ -2,20 +2,27 @@
 """
 vgn_grasp_real.py
 =================
-VGN grasp on the real robot: wrist-camera depth -> TSDF -> VGN -> the best grasp on the object
-that sits on the table (e.g. a ball), saved for the WBC (`steve_figure8_wbc --goto_file`).
+VGN grasp on the real robot: gripper/wrist-camera depth -> TSDF -> VGN -> the best grasp on the
+object that sits on the table (e.g. a ball), saved for the WBC (`steve_figure8_wbc --goto_file`).
 
 Runs where VGN runs (the PC with vgn_env); reads the camera and TF over ROS (Wi-Fi works with
-the Steve DDS profiles). Park the arm so the wrist camera looks down at the object from ~0.4-0.6 m
-(D415: no depth closer than ~0.3 m), then:
+the Steve DDS profiles). Park the arm so the camera looks down at the object from ~0.4-0.6 m
+(D415: no depth closer than ~0.31 m at 848x480), then:
 
-    ros2 run steve_wbc vgn_grasp_real --table lab_table                 # 1 view, current pose
-    ros2 run steve_wbc vgn_grasp_real --table lab_table --frames 5      # average 5 depth frames
+    ros2 run steve_wbc vgn_grasp_real                        # table measured in this view (no model)
+    ros2 run steve_wbc vgn_grasp_real --table lab_table      # a table model in the current odom
+
+The camera (--camera auto: the RealSense with aligned depth, gripper camera preferred) needs its
+pose in TF: odom <- ... <- ur5etool0 (robot) <- gripper_camera_color_optical_frame (static mount
+TF from gripper_camera.launch.py after gripper_camera_calibrator).
 
 Steps
   1. depth frames (aligned to colour) + camera_info + TF  <frame> <- camera optical frame
+  1b. without --table: the dominant horizontal plane in view is the table top; its visible
+     rectangle is saved as table model --save_table (seen_table) for the WBC's collision checks
   2. object = largest compact cluster of depth points above the table top (inside its outline)
-  3. VGN on a 0.30 m TSDF centred on the object; only grasps within `--near` of it count
+  3. VGN on a 0.30 m TSDF centred on the object in x/y with the table plane 5 cm above the volume's
+     floor (as in VGN's training scenes); only grasps within `--near` of it count
   4. gripper point (pinch) = VGN grasp + finger depth along the approach axis; orientation:
      top-down, rotated about z to VGN's finger axis (as in the MuJoCo pipeline)
 Output
@@ -85,6 +92,44 @@ def fit_table_plane(cloud, table, band=0.06, iters=4):
     return n, p0, len(pts)
 
 
+def fit_horizontal_plane(cloud, max_tilt=20.0, thr=0.008, iters=400, seed=0):
+    """Dominant near-horizontal plane (RANSAC + least squares) in a world cloud: (normal up, point,
+    inlier mask). For the table top when no table model is given."""
+    rng = np.random.default_rng(seed)
+    cos_max, best, best_k = np.cos(np.radians(max_tilt)), None, -1
+    for _ in range(iters):
+        a, b, c = cloud[rng.choice(len(cloud), 3, replace=False)]
+        n = np.cross(b - a, c - a)
+        if np.linalg.norm(n) < 1e-9:
+            continue
+        n /= np.linalg.norm(n)
+        if abs(n[2]) < cos_max:
+            continue
+        k = int((np.abs((cloud - a) @ n) < thr).sum())
+        if k > best_k:
+            best, best_k = (n, a), k
+    if best is None or best_k < 500:
+        raise ValueError("no horizontal plane (table top) in view")
+    n, a = best
+    inl = np.abs((cloud - a) @ n) < thr
+    for _ in range(3):
+        mu = cloud[inl].mean(0)
+        n = np.linalg.eigh(np.cov((cloud[inl] - mu).T))[1][:, 0]
+        inl = np.abs((cloud - mu) @ n) < thr
+    if n[2] < 0:
+        n = -n
+    return n, cloud[inl].mean(0), inl
+
+
+def table_from_plane(pts, top_z, name):
+    """Table model of the VISIBLE part of the top plate (min-area rectangle of its points)."""
+    import cv2
+    (cx, cy), (w, h), ang = cv2.minAreaRect(pts[:, :2].astype(np.float32))
+    return TableModel(name=name, frame="odom", center=[float(cx), float(cy)], yaw=float(np.radians(ang)),
+                      size=[float(w), float(h)], top_z=float(top_z), thickness=0.03, legs=[], skirt=0.0,
+                      notes=f"vgn_grasp_real: visible part of the top plate, {time.strftime('%Y-%m-%d %H:%M')}")
+
+
 def level_correction(n, p0, top_z):
     """Rotation R_c (about p0) + height shift that make the fitted plane horizontal at top_z:
     x' = R_c (x - p0) + p0 + [0, 0, top_z - p0_z]."""
@@ -127,8 +172,13 @@ def find_object(cloud, table, margin=0.03, h_max=0.25, max_ext=0.15):
 
 def main(argv=None):
     p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    p.add_argument("--table", required=True, help="table model (config/tables/<name>.yaml)")
-    p.add_argument("--camera", default="/wrist_camera", help="RealSense namespace (topics <ns>/aligned_depth_to_color/...)")
+    p.add_argument("--table", default=None,
+                   help="table model (config/tables/<name>.yaml) in the CURRENT odom; default: measure the "
+                        "table top in this view")
+    p.add_argument("--save_table", default="seen_table",
+                   help="without --table: save the measured (visible) table top as this table model")
+    p.add_argument("--camera", default="auto",
+                   help="RealSense namespace (topics <ns>/aligned_depth_to_color/...); auto: found, gripper first")
     p.add_argument("--frame", default="odom", help="world frame (must be the table model's)")
     p.add_argument("--frames", type=int, default=3, help="depth frames to fuse (same pose)")
     p.add_argument("--finger_depth", type=float, default=0.05,
@@ -151,11 +201,22 @@ def main(argv=None):
     from tf2_ros import Buffer, TransformListener
     from visualization_msgs.msg import Marker, MarkerArray
 
-    table = TableModel.load(a.table)
+    table = TableModel.load(a.table) if a.table else None
     rclpy.init()
     n = rclpy.create_node("vgn_grasp_real")
     tf = Buffer()
     TransformListener(tf, n)
+    if a.camera == "auto":
+        sfx, found, t0 = "/aligned_depth_to_color/camera_info", [], time.monotonic()
+        while not found and time.monotonic() - t0 < a.timeout:
+            rclpy.spin_once(n, timeout_sec=0.2)
+            found = sorted(t for t, _ in n.get_topic_names_and_types() if t.endswith(sfx) and n.count_publishers(t) > 0)
+        if not found:
+            sys.exit("[ERROR] no */aligned_depth_to_color/camera_info — camera running (gripper_camera.launch.py)? "
+                     "this terminal on the robot's ROS_DOMAIN_ID / DDS profile?")
+        found.sort(key=lambda t: ("gripper" not in t, "wrist" not in t))
+        a.camera = found[0][:-len(sfx)]
+        print(f"camera: {a.camera}")
     st = {"K": None, "depth": []}
     n.create_subscription(CameraInfo, f"{a.camera}/aligned_depth_to_color/camera_info",
                           lambda m: st.__setitem__("K", np.array(m.k).reshape(3, 3)), 10)
@@ -181,7 +242,8 @@ def main(argv=None):
             rclpy.spin_once(n, timeout_sec=0.05)
         tr = tf.lookup_transform(a.frame, cam_frame, Time())
     except Exception as e:
-        sys.exit(f"[ERROR] no TF {a.frame} <- {cam_frame}: {e}")
+        sys.exit(f"[ERROR] no TF {a.frame} <- {cam_frame}: {e}\n        gripper camera: the mount TF comes from "
+                 "gripper_camera.launch.py once gripper_camera_calibrator saved config/gripper_camera.yaml")
     R_wc = quat_R(tr.transform.rotation)
     t_wc = np.array([tr.transform.translation.x, tr.transform.translation.y, tr.transform.translation.z])
     # median over the frames (the arm is still): less speckle
@@ -196,10 +258,32 @@ def main(argv=None):
     ok = (z > 0.2) & (z < 2.0)
     pc = np.stack([(u[ok] - K[0, 2]) * z[ok] / K[0, 0], (v[ok] - K[1, 2]) * z[ok] / K[1, 1], z[ok]], 1)
     cloud = pc @ R_wc.T + t_wc
-    top_pts = cloud[np.abs(cloud[:, 2] - table.top_z) < 0.03]
-    print(f"table plane check: {len(top_pts)} points within 3 cm of the model top ({table.top_z:.2f} m)"
-          + (f", their median z {np.median(top_pts[:, 2]):.3f} m" if len(top_pts) else " — camera pose / table model wrong?"))
-    if not a.no_level:
+    if np.median(z[ok]) < 0.33:
+        print(f"  [WARN] median depth {np.median(z[ok]):.2f} m: closer than the D415's range (~0.31 m at 848x480)")
+    if table is None:
+        # no model: the table top is the dominant horizontal plane in view; level the camera pose on
+        # it (tilt only — its height is the measurement) and save the visible top as a table model
+        try:
+            n_pl, p_pl, inl = fit_horizontal_plane(cloud)
+        except ValueError as e:
+            sys.exit(f"[ERROR] {e}")
+        tilt = np.degrees(np.arccos(np.clip(n_pl[2], -1, 1)))
+        if tilt > a.max_level:
+            sys.exit(f"[ERROR] table plane tilted {tilt:.1f} deg in odom: camera mount TF wrong? (--max_level)")
+        R_c, _ = level_correction(n_pl, p_pl, p_pl[2])
+        if not a.no_level:
+            cloud = (cloud - p_pl) @ R_c.T + p_pl
+            t_wc = R_c @ (t_wc - p_pl) + p_pl
+            R_wc = R_c @ R_wc
+        table = table_from_plane(cloud[inl], p_pl[2], a.save_table)
+        path = table.save()
+        print(f"table top measured: z {table.top_z:.3f} m, visible {table.size[0]:.2f} x {table.size[1]:.2f} m, "
+              f"tilt {tilt:.1f} deg {'(levelled)' if not a.no_level else ''} -> table model '{table.name}' ({path})")
+    else:
+        top_pts = cloud[np.abs(cloud[:, 2] - table.top_z) < 0.03]
+        print(f"table plane check: {len(top_pts)} points within 3 cm of the model top ({table.top_z:.2f} m)"
+              + (f", their median z {np.median(top_pts[:, 2]):.3f} m" if len(top_pts) else " — camera pose / table model wrong?"))
+    if a.table and not a.no_level:
         # the table top is level at top_z: correct the camera pose's tilt + height with it (the wrist
         # camera's mount in the URDF is approximate); x/y offsets are not observable from a plane
         try:
@@ -225,8 +309,10 @@ def main(argv=None):
     vgn = VGNBridge()
     if not vgn.available:
         sys.exit("[ERROR] VGN not available (vgn_env / model) — run this on the PC with vgn_env")
+    # 30 cm TSDF: centred on the object in x/y, table plane 5 cm above its floor (VGN's training scenes)
+    centre = np.array([obj[0], obj[1], table.top_z - 0.05 + 0.5 * vgn.tsdf_size])
     for d, _ in st["depth"]:
-        vgn.add_real_view(d, t_wc, R_wc, K, obj)
+        vgn.add_real_view(d, t_wc, R_wc, K, centre)
     if not vgn.run_inference():
         sys.exit("[ERROR] VGN found no grasp")
     g = vgn.best_grasp_world(near=obj, xy_radius=a.near, z_window=0.10)

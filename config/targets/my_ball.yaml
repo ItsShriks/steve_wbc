@@ -1,0 +1,15 @@
+# Target profile 'my_ball' — recorded with target_calibrator
+name: my_ball
+hsv_ranges:
+- - 173
+  - 100
+  - 85
+  - 6
+  - 255
+  - 255
+size: 0.065
+shape: sphere
+min_pixels: 30
+notes: recall 98%, background false positives 0.14% on 2 capture(s); 2026-10-14 17:19
+samples: 2
+extra: {}

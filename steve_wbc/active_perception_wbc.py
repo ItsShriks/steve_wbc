@@ -12,9 +12,10 @@ see steve_figure8_wbc.WholeBodyController) — only the active tasks change:
   ─────────────  ──────────────────────────  ─────────────────────  ─────────────────────
   DRIVE          —                           LiDAR-reactive forward drive pose
   BACKUP         —                           reverse                drive pose
-  REPOSITION     —                           ring around the table  drive pose
+  REPOSITION     —                           smooth orbit around    drive pose
+                                             the table (TableOrbit)
                  (only if the grasp is not reachable from here with the base >= d_safe_base
-                  from the table; IK check per table side, see _plan_approach)
+                  from the table, or VGN found no grasp here; IK check per side, _plan_approach)
   SETTLE_ARM     —                           hold                   scan seed pose
   COARSE_DETECT  —                           hold                   scan pose, pan sweeps
                  (only if the object was not already tracked)
@@ -148,6 +149,7 @@ REPOSITION_SPEED = 0.25       # m/s along the ring
 # left / right from the robot's view) -> side of the table to grasp from. "here" = stay.
 VIEW_TIMEOUT = 3.0            # s  real camera: no depth frame + TF for a VGN view -> skip the view
 NO_GRASP = "no grasp candidate found"
+GOTO_DONE = "reached grasp pose"   # --goto_grasp_only
 QUADRANT_SIDE = {"bottom-left": "here", "bottom-right": "here", "top-left": "left", "top-right": "right"}
 REACH_TOL = 0.01              # m  IK residual accepted as reachable
 GRASP_YAWS = (0.0, np.pi / 2)  # top-down grasp rotations tried (fingers open along y / along x)
@@ -427,7 +429,7 @@ class WristDepthGrabber:
         self.K, self.frame_id = np.array(m.k).reshape(3, 3), m.header.frame_id
 
     def _resolve(self):
-        """--vgn_camera auto: the published */aligned_depth_to_color/camera_info, preferring 'wrist'."""
+        """--vgn_camera auto: the published */aligned_depth_to_color/camera_info, gripper camera first."""
         if self._info_sub is not None:
             return True
         from sensor_msgs.msg import CameraInfo
@@ -435,7 +437,7 @@ class WristDepthGrabber:
                        if t.endswith(self.SFX + "/camera_info") and self.node.count_publishers(t) > 0)
         if not found:
             return False
-        found.sort(key=lambda t: "wrist" not in t)
+        found.sort(key=lambda t: ("gripper" not in t, "wrist" not in t))
         self.ns = found[0][:-len(self.SFX + "/camera_info")]
         self.log.info(f"VGN depth camera: {self.ns}")
         self._info_sub = self.node.create_subscription(CameraInfo, found[0], self._info_cb, 10)
@@ -787,6 +789,111 @@ class InterceptionMPC:
         return Reference(self.p.copy(), self.v.copy(), self.R.copy(), rstep / dt, "mpc")
 
 
+class TableOrbit:
+    """Smooth base path around a rectangular table [lo, hi] (REPOSITION).
+
+    Positions p = Q(s) + d(s) N(s): Q / N run along the table outline (4 edges and 4 corners) with
+    outward normal N, s is the arc length on the ring at offset `o` (edges joined by quarter
+    circles: no corners to stop at), and the distance d to the table blends smoothly from the
+    start's to `o` (clear at any heading), and from `o` to the goal's — never closer to the table
+    than start or goal. The base faces the table all the way (yaw = direction of -N; the omni base
+    moves sideways), the speed follows a min-jerk profile (rest -> v_max -> rest), and the WBC's base
+    task gets pose + velocity feed-forward at every tick."""
+
+    def __init__(self, lo, hi, o):
+        self.lo, self.hi, self.o = np.asarray(lo, float), np.asarray(hi, float), float(o)
+        w, h = self.hi - self.lo
+        (x0, y0), (x1, y1) = self.lo, self.hi
+        q = 0.5 * np.pi * self.o
+        # ccw: (kind, length on the ring, start point / corner, edge direction, normal angle at start)
+        self.segs = [("edge", w, (x0, y0), (1, 0), -0.5 * np.pi), ("arc", q, (x1, y0), None, -0.5 * np.pi),
+                     ("edge", h, (x1, y0), (0, 1), 0.0), ("arc", q, (x1, y1), None, 0.0),
+                     ("edge", w, (x1, y1), (-1, 0), 0.5 * np.pi), ("arc", q, (x0, y1), None, 0.5 * np.pi),
+                     ("edge", h, (x0, y1), (0, -1), np.pi), ("arc", q, (x0, y0), None, np.pi)]
+        self.cum = np.concatenate([[0.0], np.cumsum([sg[1] for sg in self.segs])])
+        self.P = self.cum[-1]
+
+    def QN(self, s):
+        """Outline point Q and outward normal N at ring arc length s."""
+        s = s % self.P
+        k = min(int(np.searchsorted(self.cum, s, side="right")) - 1, 7)
+        kind, _, a, t, phi = self.segs[k]
+        u = s - self.cum[k]
+        if kind == "edge":
+            return np.asarray(a, float) + u * np.asarray(t, float), np.array([np.cos(phi), np.sin(phi)])
+        ang = phi + u / self.o
+        return np.asarray(a, float), np.array([np.cos(ang), np.sin(ang)])
+
+    def project(self, p):
+        """(s, d) of a point outside the table: its ring arc length and distance to the table."""
+        p = np.asarray(p, float)[:2]
+        (x0, y0), (x1, y1) = self.lo, self.hi
+        q = np.clip(p, self.lo, self.hi)
+        v = p - q
+        d = float(np.linalg.norm(v))
+        below, above, left, right = p[1] < y0, p[1] > y1, p[0] < x0, p[0] > x1
+        if (below or above) and (left or right):              # beside a corner: on its arc
+            k = {(True, False, False, True): 1, (False, True, False, True): 3,
+                 (False, True, True, False): 5, (True, False, True, False): 7}[(below, above, left, right)]
+            ang = (np.arctan2(v[1], v[0]) - self.segs[k][4]) % (2 * np.pi)
+            return self.cum[k] + self.o * min(ang, 0.5 * np.pi), d
+        if below:
+            return self.cum[0] + (q[0] - x0), d
+        if right:
+            return self.cum[2] + (q[1] - y0), d
+        if above:
+            return self.cum[4] + (x1 - q[0]), d
+        return self.cum[6] + (y1 - q[1]), d                 # left (or inside: nearest is ambiguous)
+
+    def path(self, start, goal, v_max, blend=0.6):
+        """OrbitPath from start (x, y, yaw) to goal (x, y, yaw), the shorter way round."""
+        s0, d0 = self.project(start)
+        s1, d1 = self.project(goal)
+        D = (s1 - s0) % self.P
+        if D > 0.5 * self.P:
+            D -= self.P
+        L = abs(D)
+        la, lb = min(blend, 0.45 * L), min(blend, 0.45 * L)
+        sm = lambda x: 3 * x ** 2 - 2 * x ** 3
+        sig = np.linspace(0.0, 1.0, max(200, int(L / 0.005)))
+        a = sm(np.clip(sig * L / max(la, 1e-9), 0, 1))
+        b = sm(np.clip((sig * L - (L - lb)) / max(lb, 1e-9), 0, 1))
+        d = self.o + (d0 - self.o) * (1 - a) + (d1 - self.o) * b
+        QN = [self.QN(s0 + x * D) for x in sig]
+        pts = np.array([Q + di * N for (Q, N), di in zip(QN, d)])
+        face = np.unwrap([np.arctan2(-N[1], -N[0]) for _, N in QN])  # base +x towards the table
+        face += 2 * np.pi * np.round((start[2] - face[0]) / (2 * np.pi))  # same 2-pi branch as the start yaw
+        yaw = face + wrap_angle(start[2] - face[0]) * (1 - a) + wrap_angle(goal[2] - face[-1]) * b
+        return OrbitPath(pts, yaw, v_max)
+
+
+class OrbitPath:
+    """Time-parameterised base path (min-jerk along its length): at(t) -> (BaseReference, done)."""
+
+    def __init__(self, pts, yaw, v_max):
+        self.pts, self.yaw = pts, np.asarray(yaw, float)
+        self.c = np.concatenate([[0.0], np.cumsum(np.linalg.norm(np.diff(pts, axis=0), axis=1))])
+        self.length = float(self.c[-1])
+        turn = float(np.abs(np.diff(self.yaw)).sum())
+        self.T = max(2.0, 1.875 * self.length / v_max, 1.875 * turn / 0.4)   # peak speed v_max, 0.4 rad/s
+
+    def __bool__(self):
+        return True
+
+    def at(self, t):
+        tau = min(max(t / self.T, 0.0), 1.0)
+        c = self.length * (10 * tau ** 3 - 15 * tau ** 4 + 6 * tau ** 5)
+        dc = self.length * (30 * tau ** 2 - 60 * tau ** 3 + 30 * tau ** 4) / self.T
+        i = int(np.clip(np.searchsorted(self.c, c) - 1, 0, len(self.c) - 2))
+        f = (c - self.c[i]) / max(self.c[i + 1] - self.c[i], 1e-9)
+        p = self.pts[i] + f * (self.pts[i + 1] - self.pts[i])
+        yw = self.yaw[i] + f * (self.yaw[i + 1] - self.yaw[i])
+        ds = max(self.c[i + 1] - self.c[i], 1e-9)
+        v = (self.pts[i + 1] - self.pts[i]) / ds * dc
+        wz = (self.yaw[i + 1] - self.yaw[i]) / ds * dc
+        return BaseReference(np.array([p[0], p[1], yw]), np.array([v[0], v[1], wz])), tau >= 1.0
+
+
 class ActivePerceptionWBC:
     def __init__(self, backend, world, kin, args):
         self.b, self.w, self.kin, self.a = backend, world, kin, args
@@ -890,24 +997,23 @@ class ActivePerceptionWBC:
             return None, BaseReference(st.base.copy(), -BACKUP_SPEED * np.array([np.cos(yaw), np.sin(yaw), 0.0])), DRIVE_POSE
 
         if self.state == "REPOSITION":
-            # drive around the table on the ring (arm tucked); the QP's base constraint still
-            # guards d_safe_base, the ring keeps the base well outside it at any heading
+            # drive around the table on a smooth orbit (TableOrbit: rounded ring, facing the table,
+            # min-jerk speed; arm tucked) — the WBC's base task tracks pose + velocity feed-forward,
+            # the QP's base constraint still guards d_safe_base. The orbit clock is the state time
+            # (t_state skips safety stops), so the reference waits during a stop.
             if not self.base_path:
                 self._enter("SETTLE_ARM", f"at the {self.side} side")
                 return None, BaseReference(self.base_hold, np.zeros(3)), DRIVE_POSE
-            wp = self.base_path[0]
-            d = wp[:2] - st.base[:2]
-            dist, yaw_err = np.linalg.norm(d), wrap_angle(wp[2] - st.base[2])
-            last = len(self.base_path) == 1
-            if dist < (0.01 if last else 0.05) and (not last or abs(yaw_err) < 0.02):
-                self.base_path.pop(0)
-                self.base_hold = wp.copy()
+            ref, done = self.base_path.at(ts)
+            err = np.linalg.norm(ref.pose[:2] - st.base[:2])
+            if done and err < 0.02 and abs(wrap_angle(ref.pose[2] - st.base[2])) < 0.03:
+                self.base_hold, self.base_path = ref.pose.copy(), []
+                self._enter("SETTLE_ARM", f"at the {self.side} side")
                 return None, BaseReference(self.base_hold, np.zeros(3)), DRIVE_POSE
-            if ts > 120.0:
-                self._enter("ABORT", "repositioning timed out")
+            if ts > self.base_path.T + 30.0:
+                self._enter("ABORT", f"repositioning timed out (base {err * 100:.0f} cm from the orbit)")
                 return None, BaseReference(st.base.copy(), np.zeros(3)), DRIVE_POSE
-            v = d / max(dist, 1e-9) * min(REPOSITION_SPEED, 1.5 * dist)
-            return None, BaseReference(np.array([st.base[0], st.base[1], wp[2]]), np.array([*v, 0.0])), DRIVE_POSE
+            return None, ref, DRIVE_POSE
 
         if self.state == "SETTLE_ARM":
             q = list(SCAN_SEED_Q)
@@ -981,7 +1087,7 @@ class ActivePerceptionWBC:
             return None, hold, list(SCAN_SEED_Q if not self.view_pans else
                                     [self.view_pans[-1], *SCAN_SEED_Q[1:]])
 
-        if self.state in ("PRE_GRASP", "DESCEND", "GRASP"):
+        if self.state in ("PRE_GRASP", "DESCEND", "GRASP", "AT_GRASP", "RETREAT"):
             # a static object keeps its estimate while occluded (by obstacles or the own gripper);
             # a moving one drifts from the constant-velocity prediction, so it is given up sooner
             static = not np.any(self.tracker.v)
@@ -1026,18 +1132,39 @@ class ActivePerceptionWBC:
                     self._enter("ABORT", "pre-grasp not reached")
                 return ref, None, ARM_HOME_Q
 
+            if self.state == "RETREAT":  # --goto_grasp_only: back up above the object, then done
+                up = [0.0, 0.0, PREGRASP_HEIGHT]
+                ref = self._mpc(up, self.grasp_R, a_max=0.3, v_max=EE_DESCEND_SPEED)
+                if np.linalg.norm(self.ee - (obj + up)) < 0.015 or ts > 6.0:
+                    e = np.array(self.at_grasp_err or [np.nan])
+                    self.result = GOTO_DONE
+                    self._enter("DONE", f"back at the pre-grasp height | during {a.hold_time:.1f} s at the grasp pose "
+                                        f"the EE was {np.nanmean(e) * 100:.1f} cm (mean), {np.nanmax(e) * 100:.1f} cm "
+                                        "(max) from the grasp point")
+                return ref, hold, ARM_HOME_Q
             off = [0.0, 0.0, a.grasp_dz]
             ref = self._mpc(off, self.grasp_R, a_max=0.3, v_max=EE_DESCEND_SPEED)
             goal = obj + off
             if self.state == "DESCEND":
                 stuck = ts > 2.0 and np.linalg.norm(self.u_prev[3:]) < 0.02  # stopped by the table margin
-                if np.linalg.norm(self.ee - goal) < 0.006 or stuck or ts > 12.0:
+                reached = np.linalg.norm(self.ee - goal) < 0.006 or stuck or ts > 12.0
+                if reached and a.goto_grasp_only:  # demo: stay at the grasp pose, never close the gripper
+                    self.at_grasp_err = []
+                    self._enter("AT_GRASP", f"EE {np.linalg.norm(self.ee - goal) * 100:.1f} cm from the grasp point"
+                                + (" (limited by table clearance)" if stuck else "")
+                                + f" | staying with the object for {a.hold_time:.1f} s, gripper not used")
+                elif reached:
                     self.w.gripper(True)
                     gt = self.w.ground_truth()
                     self._enter("GRASP", f"EE {np.linalg.norm(self.ee - goal) * 100:.1f} cm from grasp point"
                                 + (f", {np.linalg.norm((self.ee - off) - gt) * 100:.1f} cm from true object"
                                    if gt is not None else "")
                                 + (" (limited by table clearance)" if stuck else ""))
+            elif self.state == "AT_GRASP":
+                self.at_grasp_err.append(float(np.linalg.norm(self.ee - goal)))
+                if ts >= max(a.hold_time, 0.5):
+                    a.d_safe = self.d_safe
+                    self._enter("RETREAT", f"margin -> {self.d_safe * 100:.1f} cm, back up to the pre-grasp height")
             elif ts >= GRASP_TIME:
                 a.d_safe = self.d_safe
                 self.lift_goal = self.ee + [0, 0, LIFT_HEIGHT]
@@ -1369,36 +1496,12 @@ class ActivePerceptionWBC:
                          [hi[0] + o, hi[1] + o], [lo[0] - o, hi[1] + o]]), o
 
     def _ring_path(self, start, goal, lo, hi):
-        """Waypoints start -> ring -> (shorter way round) -> goal, all outside the safety field."""
-        C, o = self._ring(lo, hi)
-        seg = [np.linalg.norm(C[(i + 1) % 4] - C[i]) for i in range(4)]
-        per = sum(seg)
-
-        def project(p):  # closest ring point and its arc length
-            best = None
-            for i in range(4):
-                a_, b_ = C[i], C[(i + 1) % 4]
-                t = np.clip((p - a_) @ (b_ - a_) / (seg[i] ** 2), 0, 1)
-                q = a_ + t * (b_ - a_)
-                d = np.linalg.norm(p - q)
-                if best is None or d < best[0]:
-                    best = (d, q, sum(seg[:i]) + t * seg[i])
-            return best[1], best[2]
-
-        ps, s_s = project(start[:2])
-        pg, s_g = project(goal[:2])
-        ccw = (s_g - s_s) % per
-        corners_s = np.cumsum([0] + seg[:3])  # arc length of C[i]
-        if ccw <= per / 2:
-            mids = [C[i] for i in np.argsort((corners_s - s_s) % per) if 0 < (corners_s[i] - s_s) % per < ccw]
-            length = ccw
-        else:
-            mids = [C[i] for i in np.argsort((s_s - corners_s) % per) if 0 < (s_s - corners_s[i]) % per < per - ccw]
-            length = per - ccw
-        pts = [ps, *mids, pg]
-        path = [np.array([*p, goal[2]]) for p in pts] + [np.asarray(goal, float)]
-        length += np.linalg.norm(ps - start[:2]) + np.linalg.norm(goal[:2] - pg)
-        return path, length
+        """Smooth orbit start -> goal around the table (TableOrbit), the shorter way round:
+        (OrbitPath, length [m])."""
+        _, o = self._ring(lo, hi)
+        path = TableOrbit(lo, hi, o).path(np.asarray(start, float), np.asarray(goal, float),
+                                          min(REPOSITION_SPEED, self.a.max_base_v))
+        return path, path.length
 
     def _plan_approach(self, st, obj):
         """Cheapest base pose, among staying and the four table sides, from which the whole grasp
@@ -1411,7 +1514,7 @@ class ActivePerceptionWBC:
             self.arrival_side = here   # quadrants stay fixed to the side the robot came from
         quad, preferred = table_quadrant(obj[:2], lo, hi, self.arrival_side)
         print(f"  object in the {quad.upper()} quadrant of the table (seen from the "
-              f"{self.arrival_side} side) -> grasp from the {preferred} side")
+              f"{self.arrival_side} side) -> grasp from here ({here}) if reachable, else the {preferred} side")
         cands = []
         for name, (n, yaw) in SIDES.items():
             if name in self.bad_sides:
@@ -1431,8 +1534,9 @@ class ActivePerceptionWBC:
             cands.append((length, name, goal, path, o))
         report, chosen = [], None
         R0 = self.grasp_R.copy()
-        # the quadrant's side first; the others (by path length) only if it is not reachable
-        for cost, name, pose, path, o in sorted(cands, key=lambda c: (c[1] != preferred, c[0])):
+        # stay where the robot is if the grasp is reachable from here; else the quadrant's side, then
+        # the others by path length (sides where VGN found no grasp are not candidates)
+        for cost, name, pose, path, o in sorted(cands, key=lambda c: (c[1] != here, c[1] != preferred, c[0])):
             if np.any(o[:2] < lo + 0.03) or np.any(o[:2] > hi - 0.03):
                 report.append(f"{name}: object off the table by then")
                 continue
@@ -1536,7 +1640,7 @@ class ActivePerceptionWBC:
                               f"transit at z={self.transit_z:.2f} m")
 
                 ee_ref, base_ref, q_nom = self.update(st)
-                if ee_ref is None and self.state in ("PRE_GRASP", "DESCEND", "GRASP", "LIFT"):
+                if ee_ref is None and self.state in ("PRE_GRASP", "DESCEND", "GRASP", "AT_GRASP", "RETREAT", "LIFT"):
                     continue  # state just changed; next tick produces the reference
                 self.ctrl.q_nom = np.asarray(q_nom, float)
                 self.ctrl.yaw_nom = self.base_hold[2]
@@ -1590,12 +1694,13 @@ class ActivePerceptionWBC:
         hits = self.w.obstacle_hits
         if hits and self.result == "success":
             self.result = "lifted, but collided with obstacles"
-        if self.min_base_clr < a.d_safe_base - 1e-3 and self.result in ("success", "done"):
+        if self.min_base_clr < a.d_safe_base - 1e-3 and self.result in ("success", "done", GOTO_DONE):
             self.result = "base safety distance violated"
         print(f"\n{'─' * 74}\n  Result: {self.result}  (final state {self.state}, t={self.t:.1f} s)")
         if self.explored:
             print(f"  Explored: VGN found no grasp from the {', '.join(self.explored)} side(s)"
-                  + (f", grasped from the {self.side} side" if self.result in ("success", "done") else ""))
+                  + (f", grasp pose reached from the {self.side} side" if self.result in ("success", "done", GOTO_DONE)
+                     else ""))
         print(f"  Detections used: {self.n_seen}   rejected by the gate: {self.tracker.rejected}")
         if self.w.vgn_available() or self.vgn_status != "not run":
             views = ", ".join(f"{n} {k}" for k, n in self.vgn_views.items()) or "none"
@@ -1617,7 +1722,7 @@ class ActivePerceptionWBC:
         summarize(rows, a)
         if safety is not None:
             print(safety.summary())
-        return 0 if self.result in ("success", "done") else 1
+        return 0 if self.result in ("success", "done", GOTO_DONE) else 1
 
 
 def main(argv=None):
@@ -1657,8 +1762,8 @@ def main(argv=None):
                         "the tracked position top-down anyway. No side left: 'no grasp candidate found'")
     g.add_argument("--vgn_explore_max_sides", type=int, default=4, help="table sides to try at most")
     g.add_argument("--vgn_camera", default="auto",
-                   help="robot: RealSense namespace of the VGN depth camera (auto: the one with 'wrist', "
-                        "e.g. /wrist_camera/wrist_camera)")
+                   help="robot: RealSense namespace of the VGN depth camera (auto: gripper camera first, then "
+                        "wrist, e.g. /gripper_camera)")
     g.add_argument("--vgn_no_level", action="store_true",
                    help="robot: do not level each VGN view's camera pose on the table plane (--table)")
     g.add_argument("--vgn_max_level", type=float, default=8.0,
@@ -1670,6 +1775,14 @@ def main(argv=None):
     g.add_argument("--max_drive", type=float, default=1.5, help="max drive distance [m]")
     # --grasp_dz (build_arg_parser): pinch point relative to the object centre [m]; here -0.015
     # (set_defaults below): the pads then close at the equator
+    g.add_argument("--camera_tilt", type=float, default=0.0,
+                   help="tilt the camera forward by this much in the drive and scan poses [deg] (wrist 1); "
+                        "for a camera looking along the flange axis, which otherwise sees only the floor/table "
+                        "straight below (robot: ~30). The MJCF wrist camera is already tilted: 0")
+    g.add_argument("--goto_grasp_only", action="store_true",
+                   help="demo without a gripper: go to the grasp pose, stay there with the object (static or "
+                        "moving) for --hold_time, never close the gripper or lift, then back up to the "
+                        "pre-grasp height. Result 'reached grasp pose'")
     g.add_argument("--hold_time", type=float, default=3.0,
                    help="after the lift, keep holding the object this long; success only if it stays "
                         "in the gripper [s] (0: success at the end of the lift)")
@@ -1699,6 +1812,11 @@ def main(argv=None):
     if a.object_speed is None:
         a.object_speed = 0.0 if static_cube else 0.02  # a rolling cube would plough into the obstacles
 
+    if a.camera_tilt:  # drive + scan poses look forward-down (wrist 1 negative = camera forward)
+        for pose in (DRIVE_POSE, SCAN_SEED_Q):
+            pose[3] -= np.radians(a.camera_tilt)
+        print(f"camera tilted {a.camera_tilt:.0f} deg forward: drive pose {np.round(DRIVE_POSE, 3)}, "
+              f"scan pose {np.round(SCAN_SEED_Q, 3)}")
     table = TableModel.load(a.table) if a.table else None
     if table is not None:
         print(f"table '{table.name}' ({table.frame}): top {table.size[0]:.2f} x {table.size[1]:.2f} m at "

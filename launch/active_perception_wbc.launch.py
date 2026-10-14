@@ -98,14 +98,20 @@ def launch_setup(context: LaunchContext):
         if cfg("headless").lower() == "true":
             args.append("--headless")
     else:
+        # real robot: velocity commands (smooth; streaming one-point trajectories every 20 ms makes the
+        # trajectory controller restart its spline each time -> jerky), as steve_figure8_wbc.launch.py
+        arm_interface = cfg("arm_interface") or ("velocity" if env == "real" else "trajectory")
         args += [
             "--mode", "ros",
+            "--arm_interface", arm_interface,
             "--arm_traj_topic", ARM_TRAJ_TOPIC[env],
             "--wait_timeout", WAIT_TIMEOUT[env],
             "--scan_topic", cfg("scan_topic"),
             "--target_topic", cfg("target_topic"),
-            "--no_vgn",                          # VGN runs on the simulated depth camera only
         ]
+        if arm_interface == "velocity" and env == "real":
+            # through the bringup's arm_velocity_watchdog (zero velocity if this script stops)
+            args += ["--arm_vel_topic", "/arm_velocity_cmd", "--switch_controllers"]
         if cfg("dry_run").lower() == "true":
             args.append("--dry_run")
     # Safety stop (base + arm): the robot's EM-stop system on the real robot (buttons + scanner
@@ -116,6 +122,8 @@ def launch_setup(context: LaunchContext):
         args += ["--safety", "lidar", "--lidar_topics", *SCAN_TOPICS["gazebo"]]
     if cfg("table"):
         args += ["--table", cfg("table")]
+    if cfg("goto_grasp_only").lower() == "true":
+        args.append("--goto_grasp_only")
     args += ["--target", cfg("target")]
     args += shlex.split(cfg("extra_args"))
 
@@ -128,7 +136,12 @@ def launch_setup(context: LaunchContext):
             output="screen",
             parameters=[{"use_sim_time": env == "gazebo", "target": cfg("target"),
                          "topic_style": "gazebo" if env == "gazebo" else "realsense",
-                         "target_topic": cfg("target_topic")}],
+                         "target_topic": cfg("target_topic"),
+                         # cameras the detector uses: <name> -> topics /<name>/... (gripper_camera:
+                         # the D415 on the gripper via gripper_camera.launch.py on this PC)
+                         "cameras": [c.strip() for c in cfg("detector_cameras").split(",") if c.strip()],
+                         # no pan-tilt head among them: do not command it
+                         **({} if "pan_tilt_camera" in cfg("detector_cameras") else {"head_topic": ""})}],
         ))
     actions.append(Node(
         package="steve_wbc",
@@ -167,7 +180,8 @@ def generate_launch_description():
         DeclareLaunchArgument("object_speed", default_value="",
                               description="MuJoCo: object speed [m/s] (default: per scene)"),
         DeclareLaunchArgument("vgn", default_value="true",
-                              description="MuJoCo: VGN grasp scan (needs the vgn_env conda env)"),
+                              description="VGN grasp scan (needs the vgn_env conda env on this PC; robot: wrist-camera "
+                                          "views, no grasp -> explore other table sides)"),
         DeclareLaunchArgument("vgn_mode", default_value="scan",
                               description="MuJoCo VGN timing: scan (stop, scan, wait for inference) | "
                                           "async (same scan, inference in the background) | "
@@ -183,6 +197,12 @@ def generate_launch_description():
         DeclareLaunchArgument("table", default_value="",
                               description="measured table model (steve_wbc/config/tables, table_probe); "
                                           "robot: WBC collision model, MuJoCo: replaces the sim table"),
+        DeclareLaunchArgument("detector_cameras", default_value="pan_tilt_camera,wrist_camera",
+                              description="robot/Gazebo: cameras of the target detector, e.g. gripper_camera"),
+        DeclareLaunchArgument("arm_interface", default_value="",
+                              description="velocity | trajectory (default: velocity on the robot, trajectory in Gazebo)"),
+        DeclareLaunchArgument("goto_grasp_only", default_value="false",
+                              description="go to the grasp pose and stay there (--hold_time), no gripper / lift"),
         DeclareLaunchArgument("detector", default_value="true",
                               description="Gazebo / robot: start the target detector (red_ball_detector)"),
         DeclareLaunchArgument("log", default_value="", description="CSV log path"),

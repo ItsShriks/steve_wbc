@@ -36,9 +36,11 @@ the real robot.
 | `steve_figure8_wbc` | Figure-8 with the EE — MuJoCo (`--mode sim`), kinematic check (`--mode kin`), Gazebo / real robot over ROS 2 (`--mode ros`) |
 | `figure8_wbc_demo` | MuJoCo-only demo: figure-8 on the table while the base orbits it, then a vertical figure-8 |
 | `active_perception_wbc` | Drive (LiDAR) → perceive the object from t = 0 → (VGN scan) → **MPC interception** of its predicted path → grasp → lift → hold; every phase solved by the same 9-DOF joint-velocity WBC |
-| `red_ball_detector` | ROS 2 target detector (head + wrist RGB-D) → `/steve_perception/target_point`, uses a target profile |
+| `red_ball_detector` | ROS 2 target detector (RGB-D cameras, parameter `cameras`: head + wrist, or `[gripper_camera]`) → `/steve_perception/target_point`, uses a target profile |
 | `target_calibrator` | record a target object's colour profile with the real (or simulated) camera |
-| `table_probe` | measure the real table (LiDAR + head depth) into a table model |
+| `table_probe` | measure the real table (LiDAR + head depth, or `--lidar_only --top_z`) into a table model |
+| `gripper_camera_calibrator` | eye-in-hand calibration of the gripper camera's mount (`ur5etool0` → camera) with the ball on the table, no marker → `config/gripper_camera.yaml` |
+| `vgn_grasp_real` | one VGN grasp from the current camera view → `grasp.json` for `steve_figure8_wbc --goto_file` (table measured in the view, or `--table`) |
 
 ## Active perception + MPC interception (`active_perception_wbc`)
 
@@ -56,24 +58,30 @@ the real robot.
   moving with it, descends and grasps; during descent, grasp and lift the base holds still (soft).
 * **Hold check**: after the lift the object is held for `--hold_time` (3 s); success only if it
   is still in the gripper (catches slipping grasps).
-* **Approach side by table quadrant**: the table is split into four quadrants, seen from the side
-  the robot arrives on — `bottom-left` / `bottom-right` (near half) → grasp from where it is;
-  `top-left` / `top-right` (far half) → drive around the table to the left / right side
-  (`QUADRANT_SIDE`). The choice is verified by IK + collision checks (other sides as fallback);
-  a blocked or stalled grasp replans to another side. Driving around follows a ring on which the
-  base clears the table at any heading.
+* **Approach side**: the robot **stays on the side it is on whenever the whole grasp (pre-grasp,
+  grasp, lift) is reachable from there** (IK + collision check with the base at the stand-off).
+  Only if not does it drive around the table: first to the side the object's quadrant points to
+  (table split into four quadrants seen from the arrival side; far half → left / right side,
+  `QUADRANT_SIDE`), then the others by path length. A blocked or stalled grasp, or VGN finding no
+  grasp, replans to another side.
+* **Driving around the table** (`TableOrbit`): one smooth path, not corner-to-corner — a ring at a
+  distance on which the base clears the table at any heading, with straight sides joined by
+  circular arcs, blended smoothly from the start's distance onto the ring and down to the goal's
+  (never closer to the table than start or goal); the base faces the table all the way (the omni
+  base moves sideways and turns through the corners), min-jerk speed profile (peak 0.25 m/s or
+  `--max_base_v`), tracked by the WBC's base task as pose + velocity feed-forward.
 * **Obstacles** (`--scene clutter`): only the target is picked; the gripper flies over obstacles in
   its path (transit height) and the arm keeps ≥ 2 cm from them (hard constraints, not relaxed in
   the final descent). Any robot–obstacle contact fails the run.
 * **VGN** (MuJoCo and robot): TSDF views + inference in the `vgn_env` conda env (run isolated from
   `~/.local` and the ROS `PYTHONPATH`); VGN itself (bridge, worker, weights) lives in
   `steve_perception.vgn` — see its README for the `vgn_env` setup. Only grasps **on the target** are used (within its size
-  of the tracked position). On the robot the views come from the wrist camera (aligned depth of
-  `/wrist_camera/wrist_camera`, found automatically, `--vgn_camera`) with its pose from TF
-  (`odom` ← `wrist_camera_color_optical_frame`, i.e. the URDF); the image topic is subscribed only
+  of the tracked position). On the robot the views come from the camera with aligned depth (found
+  automatically, gripper camera first, `--vgn_camera`) with its pose from TF (`odom` ← the depth
+  image's frame, e.g. the calibrated `gripper_camera_color_optical_frame`); the image topic is subscribed only
   while views are taken, a view is a frame that arrives after the arm stopped, and with `--table` each
   view's pose is **levelled on the table plane** (tilt + height of the camera mount; `--vgn_no_level`,
-  `--vgn_max_level` 8°). VGN runs on the PC that has `vgn_env` (see [Real robot with VGN](#real-robot-with-vgn-and-exploration)).
+  `--vgn_max_level` 8°). VGN runs on the PC that has `vgn_env` (see [Real robot](#real-robot-gripper-camera-on-the-pc)).
   Three timing modes, `--vgn_mode` / separate launch files:
 
   | Mode | Launch file | Views | Inference | Robot waits |
@@ -85,6 +93,16 @@ the real robot.
   Inference time is charged 1:1 to simulation time, so the modes compare fairly
   (`python3 test/compare_vgn_modes.py`). A result arriving after the descent started is ignored;
   `--vgn_max_wait` bounds a hover at the pre-grasp.
+* **Go to the grasp pose only** (`--goto_grasp_only`, launch `goto_grasp_only:=true`; no gripper on
+  the arm): after the descent the EE stays at the grasp pose with the object (static or moving) for
+  `--hold_time`, never closes a gripper or lifts, then backs up to the pre-grasp height
+  (`AT_GRASP → RETREAT → DONE`, result `reached grasp pose`, with the mean / max EE distance from the
+  grasp point). `--grasp_dz 0.05` hovers 5 cm higher.
+* **Camera tilt** (`--camera_tilt DEG`): a camera looking along the flange axis sees only the
+  floor / table straight below in the drive and scan poses (the MJCF wrist camera is mounted tilted);
+  the tilt turns wrist 1 so it looks forward-down. With the gripper camera ~25° covers the table from
+  ~0.65 to ~1.3 m ahead of the base centre (0°: 0.38–0.80 m). Keep 0 in MuJoCo (the tilted arm
+  blocks the simulated head camera).
 * **Exploration when VGN finds no grasp** (`--vgn_explore`, default `fuse`, static objects): the
   side is marked as tried, the base drives around the table (the same ring path as a replan) to the
   next reachable side, the arm scans again (`--vgn_views` per side) and VGN runs on **all sides' views
@@ -111,26 +129,45 @@ ros2 run steve_wbc active_perception_wbc --mode sim --object_type box --object_s
 ros2 launch steve_wbc active_perception_wbc.launch.py use_sim_time:=false dry_run:=true table:=lab_table target:=my_ball
 ```
 
-### Real robot with VGN and exploration
+### Real robot: gripper camera on the PC
 
-VGN needs `vgn_env` + a GPU, so `active_perception_wbc` runs on the **PC**, the robot keeps its
-bringup (`ROS_AUTOSTART.sh`: base, UR driver, LiDARs, wrist camera, `red_ball_detector`). Use the
-**Ethernet** link for the 50 Hz control loop (Wi-Fi works for RViz, not for control). The robot's
-Fast DDS profile (`steve_hardware_bringup/config/fastdds_steve.xml`) caps datagrams at 1400 B; on
-the PC use `fastdds_remote_pc.xml` with the robot's **Ethernet** address in place of `10.7.4.213`
+Setup as tested (2026-10-14): **no gripper**; a D415 hangs ~5 cm below the flange on a short post,
+looking along the flange axis, its USB cable to the **PC**. The robot runs its bringup
+(`ROS_AUTOSTART.sh`: base, UR driver, LiDARs — no pan-tilt camera); the PC runs the camera driver,
+the detector and `active_perception_wbc` (+ VGN in `vgn_env`). The arm is commanded with velocity
+commands through the bringup's `arm_velocity_watchdog` (launch default on the robot; streamed
+trajectories made it jerky). Over the lab Wi-Fi the robot state arrives at 544 Hz (joint states) /
+102 Hz (odom) with gaps < 40 ms; Ethernet is still the better link for the control loop.
+
+Every PC terminal: `export ROS_DOMAIN_ID=74 RMW_IMPLEMENTATION=rmw_fastrtps_cpp
+FASTRTPS_DEFAULT_PROFILES_FILE=~/.ros/fastdds_steve.xml` — the PC profile must also list
+`127.0.0.1` as discovery peer, else the PC's own nodes (camera, RViz, WBC) never find each other
 (see [`steve_hardware_bringup`](../steve_hardware_bringup/README.md#remote-pc-rviz-etc-over-wi-fi)).
 
-```bash
-export ROS_DOMAIN_ID=74 RMW_IMPLEMENTATION=rmw_fastrtps_cpp FASTRTPS_DEFAULT_PROFILES_FILE=~/.ros/fastdds_steve.xml
-ros2 run steve_wbc active_perception_wbc --mode ros --dry_run --table lab_table --target my_ball   # first
-ros2 run steve_wbc active_perception_wbc --mode ros --table lab_table --target my_ball \
-    --max_base_v 0.10 --max_arm_vel 0.3                                                        # then real
-```
+| Step | Command (PC) | Result |
+|---|---|---|
+| Camera | `ros2 launch steve_wbc gripper_camera.launch.py` | `/gripper_camera/{color,aligned_depth_to_color}/...` (848x480 @ 30, D415 min. range ~0.31 m), + mount TF once calibrated |
+| Ball profile (once) | `ros2 run steve_wbc target_calibrator --name my_ball --size 0.065 --topic /gripper_camera/color/image_raw` | `config/targets/my_ball.yaml` |
+| Camera mount (once per mounting) | `ros2 run steve_wbc gripper_camera_calibrator --target my_ball`; ball on the table, base still, 8 arm poses (`manipulator --direct joints ...`), Enter at each, `s` | `config/gripper_camera.yaml`: `ur5etool0` → `gripper_camera_color_optical_frame` |
+| Table (after every bringup restart: `odom` resets) | robot 0.3–1.5 m in front of the table: `ros2 run steve_wbc table_probe --name lab_table --lidar_only --top_z 0.827` | `config/tables/lab_table.yaml` (odom) |
+| Detector check | `ros2 run steve_wbc red_ball_detector --ros-args -p target:=my_ball -p topic_style:=realsense -p "cameras:=[gripper_camera]" -p "head_topic:=''"` | `/steve_perception/target_point` (odom) |
+| Dry run (robot does not move) | `ros2 launch steve_wbc active_perception_wbc.launch.py use_sim_time:=false launch_bringup:=false dry_run:=true table:=lab_table target:=my_ball detector_cameras:=gripper_camera vgn:=false goto_grasp_only:=true extra_args:="--camera_tilt 25"` | `... → AT_GRASP → RETREAT → DONE`, `reached grasp pose` |
+| Real run (robot ~1 m back, arm `home`) | the same without `dry_run:=true`, `extra_args:="--camera_tilt 25 --max_base_v 0.10 --max_arm_vel 0.3 --grasp_dz 0.05"` | drives up, finds the ball, hovers 5 cm above the grasp pose, backs up |
 
-In the dry run the robot does not move, so all VGN views come from where it stands; check that
-the views are taken (`VGN view n …`, `levelled on the table: x deg`) and that VGN finds the grasp.
-A levelling correction above 8° / 6 cm is refused: the camera TF is wrong — check in RViz that the
-URDF arm matches the real arm (`steve_simulation` must be at `origin/test`: UR mount +90°).
+Then `vgn:=true` (VGN views from the gripper camera, levelled on the table plane; no grasp → other
+sides, see above) and a slowly rolling ball. Without a gripper keep `--grasp_dz` ≥ 0.05: at the true
+grasp pose (pinch point 16 cm beyond the flange) the camera would end ~1 cm above the ball.
+
+Calibration of 2026-10-14: ball RMS 0.17 cm over 8 poses, table level within 0.3°; mount xyz
+(0.037, −0.005, 0.048) m, rpy (0.6, 0.2, 179.3)° (±4 mm, ±0.6°); table top 0.827 m.
+The 8 poses look at a ball 27 cm inside the table's near edge from 0.36–0.56 m and keep the flange
+≥ 1.14 m high over the table — `table_reach` puts it only 0.20 m above the table: not with a tool
+mounted.
+
+**`vgn_grasp_real`** (one grasp for `steve_figure8_wbc --goto_file`): camera found automatically
+(gripper first), the table top measured in the view (dominant horizontal plane, saved as table model
+`seen_table` for the WBC's collision checks; `--table` for a model), VGN's 30 cm TSDF placed as in its
+training scenes (table plane 5 cm above the volume floor).
 
 Without ROS (e.g. macOS): all scripts are also in `steve_ros2_ws/scripts/`
 (`mjpython active_perception_wbc.py`, `mjpython figure8_wbc.py`, `mjpython steve_figure8_wbc.py --mode sim`).
@@ -288,6 +325,3 @@ python3 test/compare_vgn_modes.py                             # VGN timing modes
 FAIL=1   python3 test/vgn_explore_runner.py --mode sim --headless --object_speed 0 --target_xy 1.85 -0.10  # -> other side, success
 FAIL=all python3 test/vgn_explore_runner.py --mode sim --headless --object_speed 0 --target_xy 1.85 -0.10  # -> no grasp candidate found
 ```
-
-`test_single_moving_ball` currently fails (2026-10-14): the quadrant planner sends the robot
-around the table after the rolling ball, which it then loses.

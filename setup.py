@@ -52,6 +52,8 @@ setup(
             'table_approach = steve_wbc.table_approach:main',
             # real robot: wrist-camera depth -> VGN -> grasp on the object on the table (PC, vgn_env)
             'vgn_grasp_real = steve_wbc.vgn_grasp_real:main',
+            # eye-in-hand calibration of the gripper camera's mount (ball on the table, no marker)
+            'gripper_camera_calibrator = steve_wbc.gripper_camera_calibrator:main',
         ],
     },
 )
