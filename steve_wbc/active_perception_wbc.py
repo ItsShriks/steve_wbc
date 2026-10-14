@@ -146,6 +146,8 @@ RING_MARGIN = 0.05            # m  ring around the table: clear at any heading, 
 REPOSITION_SPEED = 0.25       # m/s along the ring
 # Table quadrants as seen from the side the robot arrives on (bottom = near half, top = far half,
 # left / right from the robot's view) -> side of the table to grasp from. "here" = stay.
+VIEW_TIMEOUT = 3.0            # s  real camera: no depth frame + TF for a VGN view -> skip the view
+NO_GRASP = "no grasp candidate found"
 QUADRANT_SIDE = {"bottom-left": "here", "bottom-right": "here", "top-left": "left", "top-right": "right"}
 REACH_TOL = 0.01              # m  IK residual accepted as reachable
 GRASP_YAWS = (0.0, np.pi / 2)  # top-down grasp rotations tried (fingers open along y / along x)
@@ -199,7 +201,46 @@ def build_model(path, scene, intruder=False, table=None):
 # ══════════════════════════════════════════════════════════════════════════════
 # World interfaces: perception, LiDAR, gripper  (MuJoCo  |  ROS 2)
 # ══════════════════════════════════════════════════════════════════════════════
-class SimWorld:
+class VGNInference:
+    """VGN inference shared by SimWorld and RosWorld (self.vgn: VGNBridge, self.target: profile).
+    Inference runs in the vgn_env worker process. Its duration is measured in wall-clock time and
+    returned with the result, so the caller can charge it to simulation time."""
+    vgn = None
+    vgn_target = None  # (position) VGN grasps must lie near, in the TSDF frame
+
+    def vgn_available(self):
+        return self.vgn is not None and self.vgn.available
+
+    def vgn_n_views(self):
+        return self.vgn.n_views
+
+    def vgn_best(self):
+        """Blocking: (grasp or None, inference duration [s])."""
+        t0 = time.monotonic()
+        ok = self.vgn.run_inference()
+        return (self.vgn.best_grasp_world(*self._vgn_near()) if ok else None), time.monotonic() - t0
+
+    def vgn_start(self):
+        """Non-blocking: start inference in the background. False if it cannot start."""
+        self._vgn_t0 = time.monotonic()
+        return self.vgn.start_inference()
+
+    def vgn_poll(self):
+        """None while running; else (grasp or None, inference duration [s])."""
+        r = self.vgn.poll_inference()
+        if r is None:
+            return None
+        return (self.vgn.best_grasp_world(*self._vgn_near()) if r else None), time.monotonic() - self._vgn_t0
+
+    def _vgn_near(self):
+        """Only VGN grasps on the target object: within its radius + 3 cm horizontally and
+        +8 cm vertically (VGN's grasp centre sits above the object's centre)."""
+        if self.vgn_target is None:
+            return ()
+        return self.vgn_target, self.target.radius + 0.03, self.target.radius + 0.08
+
+
+class SimWorld(VGNInference):
     """Wrist-camera perception, rangefinder LiDAR and gripper actuator in MuJoCo."""
 
     def __init__(self, backend: MujocoSimBackend, args):
@@ -351,9 +392,6 @@ class SimWorld:
         self.b.data.ctrl[self.grip_act] = 255.0 if close else 0.0
 
     # VGN (simulation only)
-    def vgn_available(self):
-        return self.vgn is not None and self.vgn.available
-
     def vgn_init(self, center):
         self.vgn.init_tsdf(center)
 
@@ -362,41 +400,124 @@ class SimWorld:
         return self.vgn.collect_view(self.b.model, self.b.data, self.renderer, self.cfg.cam_name, center,
                                      obj_shift)
 
-    def vgn_n_views(self):
-        return self.vgn.n_views
 
-    # Inference runs in the vgn_env worker process. Its duration is measured in wall-clock
-    # time and returned with the result, so the caller can charge it to simulation time.
-    def vgn_best(self):
-        """Blocking: (grasp or None, inference duration [s])."""
-        t0 = time.monotonic()
-        ok = self.vgn.run_inference()
-        return (self.vgn.best_grasp_world(*self._vgn_near()) if ok else None), time.monotonic() - t0
+class WristDepthGrabber:
+    """Real wrist-camera depth views for VGN: aligned depth + camera_info of the RealSense node and
+    the camera pose from TF (odom <- optical frame; the URDF's wrist_camera_* frames). The image
+    topic is subscribed only while views are taken (images are large over the network). A view is
+    a frame that ARRIVED after the request (the caller asks once the arm is still), with the latest
+    TF (the robot is still; no clock sync between robot and PC needed).
+    With a table model each view's pose is levelled on the table top (as vgn_grasp_real): tilt and
+    height of an approximate camera mount are corrected, x/y are not observable from a plane."""
 
-    def vgn_start(self):
-        """Non-blocking: start inference in the background. False if it cannot start."""
-        self._vgn_t0 = time.monotonic()
-        return self.vgn.start_inference()
+    SFX = "/aligned_depth_to_color"
 
-    def vgn_poll(self):
-        """None while running; else (grasp or None, inference duration [s])."""
-        r = self.vgn.poll_inference()
-        if r is None:
+    def __init__(self, node, tf, args, table):
+        from sensor_msgs.msg import CameraInfo
+        self.node, self.tf, self.a, self.table = node, tf, args, table
+        self.log = node.get_logger()
+        self.ns = args.vgn_camera
+        self.K, self.frame_id, self._sub, self._t_req, self._got = None, None, None, None, None
+        self._info_sub = None
+        if self.ns != "auto":
+            self._info_sub = node.create_subscription(CameraInfo, f"{self.ns}{self.SFX}/camera_info",
+                                                      self._info_cb, 10)
+
+    def _info_cb(self, m):
+        self.K, self.frame_id = np.array(m.k).reshape(3, 3), m.header.frame_id
+
+    def _resolve(self):
+        """--vgn_camera auto: the published */aligned_depth_to_color/camera_info, preferring 'wrist'."""
+        if self._info_sub is not None:
+            return True
+        from sensor_msgs.msg import CameraInfo
+        found = sorted(t for t, _ in self.node.get_topic_names_and_types()
+                       if t.endswith(self.SFX + "/camera_info") and self.node.count_publishers(t) > 0)
+        if not found:
+            return False
+        found.sort(key=lambda t: "wrist" not in t)
+        self.ns = found[0][:-len(self.SFX + "/camera_info")]
+        self.log.info(f"VGN depth camera: {self.ns}")
+        self._info_sub = self.node.create_subscription(CameraInfo, found[0], self._info_cb, 10)
+        return True
+
+    def _depth_cb(self, m):
+        if self._got is None and time.monotonic() >= self._t_req:
+            self._got = m
+
+    def request(self):
+        """Start (or keep) the image subscription; only frames arriving from now on count."""
+        from rclpy.qos import qos_profile_sensor_data
+        from sensor_msgs.msg import Image
+        if not self._resolve():
+            return
+        self._t_req, self._got = time.monotonic() + 0.1, None  # frames already in flight: older
+        if self._sub is None:
+            self._sub = self.node.create_subscription(Image, f"{self.ns}{self.SFX}/image_raw", self._depth_cb,
+                                                      qos_profile_sensor_data)
+
+    def stop(self):
+        if self._sub is not None:
+            self.node.destroy_subscription(self._sub)
+            self._sub = None
+
+    def poll(self):
+        """(depth [m], R_world_optical, t_world_optical, K) once a fresh frame + TF are there, else None."""
+        m = self._got
+        if m is None or self.K is None:
             return None
-        return (self.vgn.best_grasp_world(*self._vgn_near()) if r else None), time.monotonic() - self._vgn_t0
+        self._got = None
+        if m.encoding in ("16UC1", "mono16"):
+            d = np.frombuffer(m.data, np.uint16).reshape(m.height, m.width).astype(np.float32) / 1000.0
+        else:
+            d = np.frombuffer(m.data, np.float32).reshape(m.height, m.width).copy()
+        from rclpy.time import Time
+        try:
+            tr = self.tf.lookup_transform("odom", m.header.frame_id or self.frame_id, Time())
+        except Exception as e:
+            self.log.warn(f"VGN view skipped: no TF odom <- {m.header.frame_id}: {e}")
+            return None
+        q, tt = tr.transform.rotation, tr.transform.translation
+        x, y, z, w = q.x, q.y, q.z, q.w
+        R = np.array([[1 - 2 * (y * y + z * z), 2 * (x * y - z * w), 2 * (x * z + y * w)],
+                      [2 * (x * y + z * w), 1 - 2 * (x * x + z * z), 2 * (y * z - x * w)],
+                      [2 * (x * z - y * w), 2 * (y * z + x * w), 1 - 2 * (x * x + y * y)]])
+        t = np.array([tt.x, tt.y, tt.z])
+        if self.table is not None and not self.a.vgn_no_level:
+            R, t = self._level(d, R, t)
+        return d, R, t, self.K
 
-    def _vgn_near(self):
-        """Only VGN grasps on the target object: within its radius + 3 cm horizontally and
-        +8 cm vertically (VGN's grasp centre sits above the object's centre)."""
-        if self.vgn_target is None:
-            return ()
-        return self.vgn_target, self.target.radius + 0.03, self.target.radius + 0.08
+    def _level(self, D, R, t):
+        """Camera pose corrected so the table top in this view is level at top_z (see the class doc)."""
+        try:
+            from steve_wbc.vgn_grasp_real import fit_table_plane, level_correction
+        except ImportError:
+            from vgn_grasp_real import fit_table_plane, level_correction
+        K = self.K
+        v, u = np.mgrid[0:D.shape[0]:3, 0:D.shape[1]:3]
+        z = D[v, u]
+        ok = (z > 0.2) & (z < 2.0)
+        pc = np.stack([(u[ok] - K[0, 2]) * z[ok] / K[0, 0], (v[ok] - K[1, 2]) * z[ok] / K[1, 1], z[ok]], 1)
+        try:
+            n, p0, n_in = fit_table_plane(pc @ R.T + t, self.table)
+        except ValueError as e:
+            print(f"  VGN view: no table-plane levelling ({e})")
+            return R, t
+        R_c, dz = level_correction(n, p0, self.table.top_z)
+        tilt = np.degrees(np.arccos(np.clip(n[2], -1, 1)))
+        if tilt > self.a.vgn_max_level or abs(dz[2]) > 0.06:
+            print(f"  VGN view: table plane {tilt:.1f} deg / {dz[2] * 100:+.1f} cm off the model — too large, "
+                  "not corrected (camera mount / table model / URDF shoulder offset?)")
+            return R, t
+        print(f"  VGN view levelled on the table: {tilt:.1f} deg, {dz[2] * 100:+.1f} cm ({n_in} plane points)")
+        return R_c @ R, R_c @ (t - p0) + p0 + dz
 
 
-class RosWorld:
-    """LiDAR from a LaserScan, object from a PointStamped, gripper via GripperCommand."""
+class RosWorld(VGNInference):
+    """LiDAR from a LaserScan, object from a PointStamped, gripper via GripperCommand,
+    VGN views from the wrist camera (depth + TF)."""
 
-    def __init__(self, node, args, get_base, dry_run):
+    def __init__(self, node, args, get_base, dry_run, table=None):
         from geometry_msgs.msg import PointStamped
         from sensor_msgs.msg import LaserScan
         self.node, self.a, self.get_base, self.dry_run = node, args, get_base, dry_run
@@ -416,6 +537,46 @@ class RosWorld:
             from rclpy.action import ActionClient
             self._GripperCommand = GripperCommand
             self._grip = ActionClient(node, GripperCommand, args.gripper_action)
+        # VGN: runs on this PC (vgn_env), views from the real wrist camera
+        self.table = table
+        self.target = TargetProfile.load(args.target)  # object size for the grasp filter
+        self.vgn = VGNBridge() if not args.no_vgn else None
+        self._depth = WristDepthGrabber(node, self._tf, args, table) if self.vgn is not None else None
+        if self.vgn is not None and self.vgn.available:
+            self.vgn.start_health_check()
+
+    def vgn_available(self):
+        if self.vgn is None:
+            return False
+        if self.vgn.health(timeout=60.0) is None:   # environment check still running: not yet
+            return False
+        return self.vgn.available
+
+    def vgn_init(self, center):
+        self.vgn.init_tsdf(np.asarray(center, float))
+
+    def vgn_view(self, center, obj_shift=None):
+        """None while waiting for a fresh depth frame (the caller retries), else the view count."""
+        if self._depth._sub is None or self._depth._t_req is None:
+            self._depth.request()
+            return None
+        r = self._depth.poll()
+        if r is None:
+            return None
+        d, R, t, K = r
+        if obj_shift is not None:  # object moved / odometry drifted since the TSDF was set up
+            t = t - np.asarray(obj_shift, float)
+        n = self.vgn.add_real_view(d, t, R, K, center)
+        self._depth._t_req = None   # the next call requests the next frame
+        return n
+
+    def vgn_start(self):
+        self._depth.stop()
+        return super().vgn_start()
+
+    def vgn_best(self):
+        self._depth.stop()
+        return super().vgn_best()
 
     def _scan_cb(self, msg):
         ang = msg.angle_min + msg.angle_increment * np.arange(len(msg.ranges))
@@ -483,9 +644,6 @@ class RosWorld:
         goal = self._GripperCommand.Goal()
         goal.command.position, goal.command.max_effort = pos, self.a.grip_effort
         self._grip.send_goal_async(goal)
-
-    def vgn_available(self):
-        return False
 
     obstacle_hits = {}  # no contact monitoring outside the simulation
 
@@ -697,6 +855,10 @@ class ActivePerceptionWBC:
             self._perceive()
             if self.w.vgn_available():
                 self._vgn_update()
+            if self.explore_why is not None and self.state in ("VGN_WAIT", "PRE_GRASP"):
+                why, self.explore_why = self.explore_why, None
+                self._explore(st, why)
+                return None, BaseReference(st.base.copy(), np.zeros(3)), list(st.q)
 
         if self.state == "DRIVE":
             front = self.w.front_distance()
@@ -785,13 +947,25 @@ class ActivePerceptionWBC:
                 q[0] = self.view_pans[self.view_i]
                 if abs(st.q[0] - q[0]) < 0.03 and np.max(np.abs(self.u_prev)) < 0.03:
                     n = self._vgn_capture(st, "scan")
-                    print(f"  VGN view {n} at pan={st.q[0]:.3f} rad")
+                    if n is None:  # real camera: waiting for a depth frame taken at this pose
+                        self.view_wait_t0 = t if self.view_wait_t0 is None else self.view_wait_t0
+                        if t - self.view_wait_t0 > VIEW_TIMEOUT:
+                            print(f"  VGN view at pan={st.q[0]:.3f} rad skipped: no depth frame + TF "
+                                  f"within {VIEW_TIMEOUT:.0f} s")
+                            self.view_i, self.view_wait_t0 = self.view_i + 1, None
+                        return None, hold, q
+                    self.view_wait_t0 = None
+                    print(f"  VGN view {n} at pan={st.q[0]:.3f} rad ({self.side or 'here'} side)")
                     self.view_i += 1
+                return None, hold, q
+            if self.w.vgn_n_views() == 0:  # no grasp can be known: as if VGN found none
+                self.vgn_t_start, self.vgn_result, self.vgn_ready_t = t, (None,), t
+                self._enter("VGN_WAIT", "VGN: no depth view could be taken")
                 return None, hold, q
             if a.vgn_mode == "scan":  # original: run inference and wait for it
                 print("  running VGN inference ...")
                 self.vgn_t_start = t
-                self.w.vgn_target = self.tracker.predict(t)
+                self.w.vgn_target = self._vgn_target()
                 best, dur = self.w.vgn_best()
                 self.vgn_result, self.vgn_ready_t = (best,), t + dur
                 self._enter("VGN_WAIT", f"inference took {dur:.1f} s -> robot waits that long")
@@ -837,6 +1011,9 @@ class ActivePerceptionWBC:
                         off[2] = max(PREGRASP_HEIGHT, self.transit_z - obj[2])
                 ref = self._mpc(off, self.grasp_R, a_max=0.6, v_max=EE_APPROACH_SPEED)
                 goal = obj + off
+                if self.a.vgn_explore != "off" and (self.vgn_pending or
+                                                    (self.vgn_result is not None and not self.vgn_used)):
+                    self.t_state = t - min(ts, 1.0)  # the pre-grasp timeouts count from the VGN result
                 if (np.linalg.norm(self.ee - goal) < 0.01 and np.linalg.norm(self.mpc.v - v_obj) < 0.01
                         and ts > 1.0 and not self._vgn_hover()):
                     a.d_safe = a.d_safe_grasp  # fingers may come close to the table now
@@ -912,8 +1089,13 @@ class ActivePerceptionWBC:
             self.placed = True
             plan = self._plan_approach(st, obj)
             if plan is None:
-                self._enter("ABORT", f"object not reachable from any side of the table with the base "
-                                     f"{self.a.d_safe_base * 100:.0f} cm away")
+                if self.explored:
+                    self.result = NO_GRASP
+                    self._enter("ABORT", f"{NO_GRASP.upper()} — VGN found no grasp from the "
+                                         f"{', '.join(self.explored)} side(s); no other side is reachable")
+                else:
+                    self._enter("ABORT", f"object not reachable from any side of the table with the base "
+                                         f"{self.a.d_safe_base * 100:.0f} cm away")
                 return
             if plan["path"]:
                 self.side, self.base_path = plan["side"], plan["path"]
@@ -929,28 +1111,52 @@ class ActivePerceptionWBC:
                 self._vgn_launch()
                 self._enter("PRE_GRASP", f"{why}; {have} VGN views from the drive, inference in the background")
                 return
-            need = max(self.a.vgn_views - have, 1) if have else self.a.vgn_views
+            need = (self.a.vgn_views if self.explored  # a full scan from every new side
+                    else max(self.a.vgn_views - have, 1) if have else self.a.vgn_views)
             c = self._pan_to(st, obj)
             self.view_pans = list(np.linspace(c - 0.20, c + 0.20, need)) if need > 1 else [c]
             self.view_i = 0
             if self.vgn_t0 is None:
                 self._vgn_init(obj)
             self._enter("VGN_SCAN", f"{why}; {need} TSDF views around pan={c:.2f} rad"
-                        + (f" (+{have} from the drive)" if have else ""))
+                        + (f" (+{have} fused from the {', '.join(self.explored)} side(s))" if self.explored and have
+                           else f" (+{have} from the drive)" if have else ""))
         else:
             self._enter("PRE_GRASP", f"{why}; MPC interception of the predicted path (VGN off)")
 
     # ── VGN: views, background inference, result ───────────────────────────
     def _vgn_init(self, obj):
+        self.vgn_center = np.asarray(obj, float).copy()
         self.w.vgn_init(obj)
         self.vgn_t0 = self.t  # TSDF frame = object at this time
 
+    def _vgn_fused_sides(self):
+        """Views of several table sides in one TSDF (--vgn_explore fuse, after the first side)."""
+        return bool(self.explored) and self.a.vgn_explore == "fuse" and self.vgn_center is not None
+
     def _vgn_shift(self):
-        """Object motion since the TSDF was initialised (drive mode compensates it)."""
-        return self.tracker.v * (self.t - self.vgn_t0) if self.a.vgn_mode == "drive" else None
+        """Object motion since the TSDF was initialised (drive mode compensates it). Across table
+        sides: the tracked object's offset from the TSDF centre — object motion, and on the real
+        robot the odometry drift of the drive around the table (camera and detections share it)."""
+        if self.a.vgn_mode == "drive":
+            return self.tracker.v * (self.t - self.vgn_t0)
+        if self._vgn_fused_sides():
+            return self.tracker.predict(self.t) - self.vgn_center
+        return None
+
+    def _vgn_target(self, t_ref=None):
+        """The target in the TSDF frame (VGN grasps must lie near it)."""
+        if self._vgn_fused_sides():
+            return self.vgn_center
+        return self.tracker.predict(self.t if t_ref is None else t_ref)
 
     def _vgn_capture(self, st, where):
+        """Take a VGN view; None while a real camera's frame is still on its way."""
         n = self.w.vgn_view(self.tracker.predict(self.t), self._vgn_shift())
+        if n is None:
+            return None
+        if self.side:
+            where = f"{where}@{self.side}"
         self.vgn_views[where] = self.vgn_views.get(where, 0) + 1
         if self.vgn_t_first is None:
             self.vgn_t_first = self.t
@@ -975,6 +1181,8 @@ class ActivePerceptionWBC:
                 if self.vgn_t0 is None:
                     self._vgn_init(obj)
                 n = self._vgn_capture(st, "drive")
+                if n is None:
+                    return q
                 print(f"  VGN view {n} while driving (object {np.linalg.norm(obj[:2] - st.base[:2]):.2f} m "
                       f"from the base)")
                 if n >= VGN_DRIVE_MAX_VIEWS and not self.vgn_pending and self.vgn_result is None:
@@ -985,7 +1193,7 @@ class ActivePerceptionWBC:
         self.vgn_t_start = self.t
         # the target in the TSDF frame (object at vgn_t0 when motion-compensated, else now)
         t_ref = self.vgn_t0 if self.a.vgn_mode == "drive" and self.vgn_t0 is not None else self.t
-        self.w.vgn_target = self.tracker.predict(t_ref)
+        self.w.vgn_target = self._vgn_target(t_ref)
         self.vgn_pending = self.w.vgn_start()
         print(f"  VGN inference started in the background ({self.w.vgn_n_views()} views)"
               if self.vgn_pending else "  VGN inference could not start")
@@ -1017,7 +1225,8 @@ class ActivePerceptionWBC:
         if self.vgn_hover_t0 is None:
             self.vgn_hover_t0 = self.t
             print(f"  at the pre-grasp before VGN is ready -> hovering (max {self.a.vgn_max_wait:.1f} s)")
-        if self.t - self.vgn_hover_t0 < self.a.vgn_max_wait:
+        if self.t - self.vgn_hover_t0 < self.a.vgn_max_wait or self.a.vgn_explore != "off":
+            # exploring: never grasp without VGN's verdict (no grasp -> another side)
             self.vgn_wait += self.dt  # robot held for VGN
             return True
         if not self.vgn_hover_gave_up:
@@ -1029,6 +1238,15 @@ class ActivePerceptionWBC:
         dur = self.vgn_ready_t - self.vgn_t_start
         if best is None:
             self.vgn_status = "no grasp"
+            late = self.state in ("DESCEND", "GRASP", "LIFT", "DONE", "ABORT")
+            # a static object: look from another side; a moving one keeps the tracked top-down grasp
+            # (it moves on while the robot drives around the table)
+            if self.a.vgn_explore != "off" and not late and not np.any(self.tracker.v):
+                side = self.side or "current"
+                self.explore_why = f"VGN: no grasp candidate on the target from the {side} side"
+                print(f"  VGN (after {dur:.1f} s, {self.w.vgn_n_views()} views): no grasp on the target "
+                      f"-> explore another side of the table")
+                return
             print(f"  VGN (after {dur:.1f} s): no grasp above threshold -> tracked position, top-down")
             return
         pos, rot, width, score = best
@@ -1047,6 +1265,33 @@ class ActivePerceptionWBC:
             # keep top-down approach, rotate about z to VGN's finger axis (assumed VGN y-axis)
             ax = rot[:, 1]
             self.grasp_R = rot_z(np.arctan2(ax[1], ax[0]) - np.pi / 2) @ R_TOPDOWN
+
+    def _explore(self, st, why):
+        """VGN found no grasp from this side: drive around the table to the next side (the views
+        of every side stay in the TSDF with --vgn_explore fuse), scan, try again. No side left:
+        'no grasp candidate found' — the robot stops, nothing is grasped."""
+        side = self.side
+        if side is None and self.w.support_rect() is not None:
+            side = self._side_of(st.base, *self.w.support_rect())
+        self.explored.append(side or "current")
+        if side:
+            self.bad_sides.add(side)
+        self.vgn_result, self.vgn_used, self.vgn_pending, self.vgn_ready_t = None, False, False, np.inf
+        self.vgn_hover_t0, self.vgn_hover_gave_up = None, False
+        if self.a.vgn_explore == "fresh":
+            self.vgn_t0, self.vgn_center = None, None  # next side: a new TSDF
+        self.grasp_R = R_TOPDOWN.copy()
+        self.placed, self.mpc, self.transit_z = False, None, None
+        self.a.d_safe = self.d_safe
+        left = [s for s in SIDES if s not in self.bad_sides]
+        if not self._can_plan() or not left or len(self.explored) >= self.a.vgn_explore_max_sides:
+            reason = ("no table model (--table): cannot plan other sides" if not self._can_plan()
+                      else f"explored {len(self.explored)} side(s)")
+            self.result = NO_GRASP
+            self._enter("ABORT", f"{NO_GRASP.upper()} — {why}; {reason}")
+            return
+        print(f"  {why} -> exploring another side (not tried yet: {', '.join(left)})")
+        self._begin_grasp_planning(st, why)
 
     # ── approach-side planning around the table ─────────────────────────────
     def _can_plan(self):
@@ -1240,6 +1485,8 @@ class ActivePerceptionWBC:
         self.vgn_views, self.vgn_last_view, self.vgn_wait = {}, None, 0.0
         self.vgn_status, self.vgn_score = "not run", None
         self.vgn_hover_t0, self.vgn_hover_gave_up = None, False
+        self.vgn_center, self.view_wait_t0 = None, None
+        self.explored, self.explore_why = [], None  # table sides where VGN found no grasp
         self.hold_slip = 0.0
         self.kin.set_state(st)
         p0, R0 = self.kin.ee_pose()
@@ -1346,6 +1593,9 @@ class ActivePerceptionWBC:
         if self.min_base_clr < a.d_safe_base - 1e-3 and self.result in ("success", "done"):
             self.result = "base safety distance violated"
         print(f"\n{'─' * 74}\n  Result: {self.result}  (final state {self.state}, t={self.t:.1f} s)")
+        if self.explored:
+            print(f"  Explored: VGN found no grasp from the {', '.join(self.explored)} side(s)"
+                  + (f", grasped from the {self.side} side" if self.result in ("success", "done") else ""))
         print(f"  Detections used: {self.n_seen}   rejected by the gate: {self.tracker.rejected}")
         if self.w.vgn_available() or self.vgn_status != "not run":
             views = ", ".join(f"{n} {k}" for k, n in self.vgn_views.items()) or "none"
@@ -1373,9 +1623,8 @@ class ActivePerceptionWBC:
 def main(argv=None):
     p = build_arg_parser("Steve active perception + VGN grasping — unified joint-velocity WBC")
     g = p.add_argument_group("active perception")
-    g.add_argument("--table", default=None,
-                   help="measured table model: name in steve_wbc/config/tables or a path (table_probe); "
-                        "sim: replaces the MJCF table, robot: the WBC's table collision model")
+    # --table (build_arg_parser): measured table model, name in steve_wbc/config/tables or a path
+    # (table_probe); sim: replaces the MJCF table, robot: the WBC's table collision model
     g.add_argument("--target_xy", type=float, nargs=2, default=None, metavar=("X", "Y"),
                    help="sim: object position on the table (default: per scene); the table spans "
                         "x 1.6..2.4, y -0.35..0.35, the robot arrives from -x")
@@ -1402,13 +1651,25 @@ def main(argv=None):
                         "(0: never wait, grasp without a late result)")
     g.add_argument("--vgn_orientation", choices=["topdown", "yaw"], default="topdown",
                    help="topdown, or top-down rotated to VGN's finger axis")
+    g.add_argument("--vgn_explore", choices=["fuse", "fresh", "off"], default="fuse",
+                   help="VGN finds no grasp on the target: drive around the table to the next side and scan "
+                        "again — fuse: all sides' views in one TSDF | fresh: a new TSDF per side | off: grasp "
+                        "the tracked position top-down anyway. No side left: 'no grasp candidate found'")
+    g.add_argument("--vgn_explore_max_sides", type=int, default=4, help="table sides to try at most")
+    g.add_argument("--vgn_camera", default="auto",
+                   help="robot: RealSense namespace of the VGN depth camera (auto: the one with 'wrist', "
+                        "e.g. /wrist_camera/wrist_camera)")
+    g.add_argument("--vgn_no_level", action="store_true",
+                   help="robot: do not level each VGN view's camera pose on the table plane (--table)")
+    g.add_argument("--vgn_max_level", type=float, default=8.0,
+                   help="robot: largest table-plane tilt correction applied to a VGN view [deg]")
     g.add_argument("--render_every", type=int, default=3, help="perception every N control ticks")
     g.add_argument("--min_detect_range", type=float, default=0.20,
                    help="ignore detections closer than this to the camera [m] (occlusion)")
     g.add_argument("--drive_speed", type=float, default=0.25, help="[m/s]")
     g.add_argument("--max_drive", type=float, default=1.5, help="max drive distance [m]")
-    g.add_argument("--grasp_dz", type=float, default=-0.015,
-                   help="pinch point relative to object centre [m] (pads then close at the equator)")
+    # --grasp_dz (build_arg_parser): pinch point relative to the object centre [m]; here -0.015
+    # (set_defaults below): the pads then close at the equator
     g.add_argument("--hold_time", type=float, default=3.0,
                    help="after the lift, keep holding the object this long; success only if it stays "
                         "in the gripper [s] (0: success at the end of the lift)")
@@ -1428,7 +1689,7 @@ def main(argv=None):
     g.add_argument("--target_timeout", type=float, default=0.5, help="max age of a target message [s]")
     g.add_argument("--gripper_action", default="/gripper_controller/gripper_cmd")
     g.add_argument("--grip_effort", type=float, default=50.0)
-    p.set_defaults(sim_q0=DRIVE_POSE, max_base_v=0.30, max_base_w=0.50, max_arm_vel=0.8)
+    p.set_defaults(sim_q0=DRIVE_POSE, max_base_v=0.30, max_base_w=0.50, max_arm_vel=0.8, grasp_dz=-0.015)
     a = parse_args(argv, p)
     if a.mode == "kin":
         sys.exit("active_perception_wbc needs perception: use --mode sim or --mode ros")
@@ -1468,8 +1729,7 @@ def main(argv=None):
         # base pose for base_link -> odom target transforms (the shadow state in a dry run)
         get_base = ((lambda: backend.st.base.copy()) if a.dry_run
                     else (lambda: None if ros.base is None else ros.base.copy()))
-        world = RosWorld(ros.node, a, get_base, a.dry_run)
-        world.table = table
+        world = RosWorld(ros.node, a, get_base, a.dry_run, table)
     try:
         return ActivePerceptionWBC(backend, world, kin, a).run()
     finally:

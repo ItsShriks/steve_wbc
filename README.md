@@ -65,10 +65,16 @@ the real robot.
 * **Obstacles** (`--scene clutter`): only the target is picked; the gripper flies over obstacles in
   its path (transit height) and the arm keeps ≥ 2 cm from them (hard constraints, not relaxed in
   the final descent). Any robot–obstacle contact fails the run.
-* **VGN** (MuJoCo): TSDF views + inference in the `vgn_env` conda env (run isolated from
+* **VGN** (MuJoCo and robot): TSDF views + inference in the `vgn_env` conda env (run isolated from
   `~/.local` and the ROS `PYTHONPATH`); VGN itself (bridge, worker, weights) lives in
   `steve_perception.vgn` — see its README for the `vgn_env` setup. Only grasps **on the target** are used (within its size
-  of the tracked position). Three timing modes, `--vgn_mode` / separate launch files:
+  of the tracked position). On the robot the views come from the wrist camera (aligned depth of
+  `/wrist_camera/wrist_camera`, found automatically, `--vgn_camera`) with its pose from TF
+  (`odom` ← `wrist_camera_color_optical_frame`, i.e. the URDF); the image topic is subscribed only
+  while views are taken, a view is a frame that arrives after the arm stopped, and with `--table` each
+  view's pose is **levelled on the table plane** (tilt + height of the camera mount; `--vgn_no_level`,
+  `--vgn_max_level` 8°). VGN runs on the PC that has `vgn_env` (see [Real robot with VGN](#real-robot-with-vgn-and-exploration)).
+  Three timing modes, `--vgn_mode` / separate launch files:
 
   | Mode | Launch file | Views | Inference | Robot waits |
   |---|---|---|---|---|
@@ -79,6 +85,22 @@ the real robot.
   Inference time is charged 1:1 to simulation time, so the modes compare fairly
   (`python3 test/compare_vgn_modes.py`). A result arriving after the descent started is ignored;
   `--vgn_max_wait` bounds a hover at the pre-grasp.
+* **Exploration when VGN finds no grasp** (`--vgn_explore`, default `fuse`, static objects): the
+  side is marked as tried, the base drives around the table (the same ring path as a replan) to the
+  next reachable side, the arm scans again (`--vgn_views` per side) and VGN runs on **all sides' views
+  fused in one TSDF** (`fresh`: a new TSDF per side). Views of later sides are shifted by the tracked
+  object's offset from the TSDF centre, which compensates the odometry drift of the drive around the
+  table (camera pose and detections share it). The robot never descends without a VGN grasp (no
+  `--vgn_max_wait` give-up). After `--vgn_explore_max_sides` (4) sides, or when no untried side is
+  reachable: **`Result: no grasp candidate found`** — the robot stops, nothing is grasped.
+  `off`, or a moving object: the old behaviour (top-down at the tracked position).
+
+  ```
+  [VGN_WAIT → REPOSITION] VGN: no grasp candidate on the target from the front side; ... -> left side (2.2 m)
+  [SETTLE_ARM → VGN_SCAN] ... 4 TSDF views around pan=0.01 rad (+4 fused from the front side(s))
+    VGN grasp ... score=1.00 ...
+    Result: success   Explored: VGN found no grasp from the front side(s), grasped from the left side
+  ```
 
 ```bash
 ros2 launch steve_wbc active_perception_wbc.launch.py                          # MuJoCo, rolling ball
@@ -88,6 +110,27 @@ ros2 launch steve_wbc active_perception_wbc_vgn_drive.launch.py scene:=clutter
 ros2 run steve_wbc active_perception_wbc --mode sim --object_type box --object_speed 0 --target_xy 2.2 0.2   # top-left quadrant
 ros2 launch steve_wbc active_perception_wbc.launch.py use_sim_time:=false dry_run:=true table:=lab_table target:=my_ball
 ```
+
+### Real robot with VGN and exploration
+
+VGN needs `vgn_env` + a GPU, so `active_perception_wbc` runs on the **PC**, the robot keeps its
+bringup (`ROS_AUTOSTART.sh`: base, UR driver, LiDARs, wrist camera, `red_ball_detector`). Use the
+**Ethernet** link for the 50 Hz control loop (Wi-Fi works for RViz, not for control). The robot's
+Fast DDS profile (`steve_hardware_bringup/config/fastdds_steve.xml`) caps datagrams at 1400 B; on
+the PC use `fastdds_remote_pc.xml` with the robot's **Ethernet** address in place of `10.7.4.213`
+(see [`steve_hardware_bringup`](../steve_hardware_bringup/README.md#remote-pc-rviz-etc-over-wi-fi)).
+
+```bash
+export ROS_DOMAIN_ID=74 RMW_IMPLEMENTATION=rmw_fastrtps_cpp FASTRTPS_DEFAULT_PROFILES_FILE=~/.ros/fastdds_steve.xml
+ros2 run steve_wbc active_perception_wbc --mode ros --dry_run --table lab_table --target my_ball   # first
+ros2 run steve_wbc active_perception_wbc --mode ros --table lab_table --target my_ball \
+    --max_base_v 0.10 --max_arm_vel 0.3                                                        # then real
+```
+
+In the dry run the robot does not move, so all VGN views come from where it stands; check that
+the views are taken (`VGN view n …`, `levelled on the table: x deg`) and that VGN finds the grasp.
+A levelling correction above 8° / 6 cm is refused: the camera TF is wrong — check in RViz that the
+URDF arm matches the real arm (`steve_simulation` must be at `origin/test`: UR mount +90°).
 
 Without ROS (e.g. macOS): all scripts are also in `steve_ros2_ws/scripts/`
 (`mjpython active_perception_wbc.py`, `mjpython figure8_wbc.py`, `mjpython steve_figure8_wbc.py --mode sim`).
@@ -241,4 +284,10 @@ Tune with `--d_safe`, `--d_influence`, `--xi`, `--d_safe_base`; disable with `--
 ```bash
 python3 -m pytest test/test_active_perception_scenes.py -v   # MuJoCo scenes (single, clutter, control; far paused)
 python3 test/compare_vgn_modes.py                             # VGN timing modes (needs vgn_env)
+# VGN exploration (needs vgn_env): VGN's verdict forced to "no grasp" for the first FAIL inferences
+FAIL=1   python3 test/vgn_explore_runner.py --mode sim --headless --object_speed 0 --target_xy 1.85 -0.10  # -> other side, success
+FAIL=all python3 test/vgn_explore_runner.py --mode sim --headless --object_speed 0 --target_xy 1.85 -0.10  # -> no grasp candidate found
 ```
+
+`test_single_moving_ball` currently fails (2026-10-14): the quadrant planner sends the robot
+around the table after the rolling ball, which it then loses.
