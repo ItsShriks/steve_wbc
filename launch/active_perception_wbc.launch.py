@@ -20,10 +20,21 @@ Usage:
     ros2 launch steve_wbc active_perception_wbc.launch.py use_sim_time:=false dry_run:=true
     ros2 launch steve_wbc active_perception_wbc.launch.py use_sim_time:=false launch_bringup:=false \\
         target_topic:=/steve_perception/target_point
+
+Perception (robot / Gazebo):
+    detector:=hsv          colour threshold of the target profile (steve_wbc red_ball_detector, default)
+    detector:=gsam         Grounded SAM with gsam_prompt (steve_perception gsam_target_detector)
+    grasp_backend:=vgn     VGN on the TSDF of the scan views (default)
+    grasp_backend:=cgn     Contact-GraspNet per view on the target's Grounded-SAM mask
+gsam / cgn need the model servers (steve_perception/model_server/README.md); this launch file
+starts them (model_servers:=auto), or keep them running in another terminal (model_servers:=false):
+    ros2 run steve_perception model_server gsam
+    ros2 run steve_perception model_server cgn
 """
 
 import os
 import shlex
+import time
 
 from ament_index_python.packages import get_package_share_directory
 from launch import LaunchContext, LaunchDescription
@@ -125,9 +136,55 @@ def launch_setup(context: LaunchContext):
     if cfg("goto_grasp_only").lower() == "true":
         args.append("--goto_grasp_only")
     args += ["--target", cfg("target")]
+    detector = {"true": "hsv"}.get(cfg("detector").lower(), cfg("detector").lower())
+    if detector not in ("hsv", "gsam", "false"):
+        raise RuntimeError(f"detector must be hsv, gsam or false, got '{cfg('detector')}'")
+    backend = cfg("grasp_backend").lower()
+    if backend not in ("vgn", "cgn"):
+        raise RuntimeError(f"grasp_backend must be vgn or cgn, got '{cfg('grasp_backend')}'")
+    if backend == "cgn":
+        if env == "mujoco":
+            raise RuntimeError("grasp_backend:=cgn needs real camera views (robot / Gazebo); MuJoCo uses VGN")
+        args += ["--grasp_backend", "cgn", "--grasp_prompt", cfg("gsam_prompt")]
+    # records: detections (detector/) and grasp scans (grasp_scan/) in this run's log folder
+    save_dir = ""
+    if cfg("save_images").lower() == "true" and env != "mujoco":
+        save_dir = os.environ.get("STEVE_LAUNCH_LOG_DIR") or os.path.expanduser(
+            f"~/ros_logs/active_perception_wbc_{time.strftime('%Y%m%d_%H%M%S')}")
+        print(f"[INFO] active_perception_wbc: images -> {save_dir}/{{detector,grasp_scan}}")
+    args += ["--save_dir", save_dir]
     args += shlex.split(cfg("extra_args"))
 
-    if env != "mujoco" and cfg("detector").lower() == "true":
+    # GPU model servers (each in its own conda env), shared by the detector and the grasp scan
+    servers = []
+    if env != "mujoco" and cfg("model_servers").lower() != "false":
+        servers += ["gsam"] if detector == "gsam" or (backend == "cgn" and cfg("vgn").lower() == "true") else []
+        servers += ["cgn"] if backend == "cgn" and cfg("vgn").lower() == "true" else []
+    for m in servers:
+        actions.append(Node(package="steve_perception", executable="model_server", name=f"model_server_{m}",
+                            arguments=[m], output="screen", emulate_tty=True))
+
+    cameras = [c.strip() for c in cfg("detector_cameras").split(",") if c.strip()]
+    if env != "mujoco" and detector == "gsam":
+        # object named by gsam_prompt, size and shape from the target profile (sphere fit for balls)
+        try:
+            from steve_wbc.target_profile import TargetProfile
+            prof = TargetProfile.load(cfg("target"))
+            size, shape = float(prof.size), ("sphere" if prof.shape == "sphere" else "other")
+        except Exception as e:
+            print(f"[WARN] target profile '{cfg('target')}' not loaded ({e}): 6.5 cm sphere assumed")
+            size, shape = 0.065, "sphere"
+        actions.append(Node(
+            package="steve_perception",
+            executable="gsam_target_detector",
+            name="target_detector",
+            output="screen",
+            parameters=[{"use_sim_time": env == "gazebo", "prompt": cfg("gsam_prompt"),
+                         "object_size": size, "shape": shape, "cameras": cameras, "save_dir": save_dir,
+                         "topic_style": "gazebo" if env == "gazebo" else "realsense",
+                         "target_topic": cfg("target_topic")}],
+        ))
+    if env != "mujoco" and detector == "hsv":
         # object position from the head + wrist RGB-D cameras (target profile from target_calibrator)
         actions.append(Node(
             package="steve_wbc",
@@ -136,10 +193,10 @@ def launch_setup(context: LaunchContext):
             output="screen",
             parameters=[{"use_sim_time": env == "gazebo", "target": cfg("target"),
                          "topic_style": "gazebo" if env == "gazebo" else "realsense",
-                         "target_topic": cfg("target_topic"),
+                         "target_topic": cfg("target_topic"), "save_dir": save_dir,
                          # cameras the detector uses: <name> -> topics /<name>/... (gripper_camera:
                          # the D415 on the gripper via gripper_camera.launch.py on this PC)
-                         "cameras": [c.strip() for c in cfg("detector_cameras").split(",") if c.strip()],
+                         "cameras": cameras,
                          # no pan-tilt head among them: do not command it
                          **({} if "pan_tilt_camera" in cfg("detector_cameras") else {"head_topic": ""})}],
         ))
@@ -203,8 +260,20 @@ def generate_launch_description():
                               description="velocity | trajectory (default: velocity on the robot, trajectory in Gazebo)"),
         DeclareLaunchArgument("goto_grasp_only", default_value="false",
                               description="go to the grasp pose and stay there (--hold_time), no gripper / lift"),
-        DeclareLaunchArgument("detector", default_value="true",
-                              description="Gazebo / robot: start the target detector (red_ball_detector)"),
+        DeclareLaunchArgument("detector", default_value="hsv",
+                              description="Gazebo / robot target detector: hsv (colour threshold, red_ball_detector; "
+                                          "'true' = hsv) | gsam (Grounded SAM with gsam_prompt) | false (none)"),
+        DeclareLaunchArgument("gsam_prompt", default_value="red ball",
+                              description="detector:=gsam / grasp_backend:=cgn: text naming the target"),
+        DeclareLaunchArgument("grasp_backend", default_value="vgn",
+                              description="grasp scan (vgn:=true): vgn (TSDF of the views) | cgn (robot / Gazebo: "
+                                          "Contact-GraspNet per view on the target's Grounded-SAM mask)"),
+        DeclareLaunchArgument("model_servers", default_value="auto",
+                              description="auto: start the GPU model servers detector:=gsam / grasp_backend:=cgn "
+                                          "need | false: already running (ros2 run steve_perception model_server ...)"),
+        DeclareLaunchArgument("save_images", default_value="true",
+                              description="robot / Gazebo: save annotated detections (detector/) and every grasp "
+                                          "scan's views with mask + grasps (grasp_scan/) in the run's log folder"),
         DeclareLaunchArgument("log", default_value="", description="CSV log path"),
         DeclareLaunchArgument("extra_args", default_value="",
                               description="Additional active_perception_wbc CLI arguments"),

@@ -22,6 +22,10 @@ table while the robot drives: the Gazebo controller otherwise holds the head sli
 upward.
 
     ros2 run steve_wbc red_ball_detector --ros-args -p use_sim_time:=true
+
+Records (save_dir, default auto = the launch's log folder, '' = off): <run>/detector/ gets an
+annotated frame every save_period s (mask, centre, position) and detections.csv with every
+published detection (steve_perception.utils.run_record, as gsam_target_detector).
 """
 
 import numpy as np
@@ -39,6 +43,10 @@ try:
     from steve_wbc.target_profile import TargetProfile
 except ImportError:
     from target_profile import TargetProfile
+try:
+    from steve_perception.utils.run_record import ImageRecorder, save_folder
+except ImportError:  # steve_perception not built: no records
+    ImageRecorder = save_folder = None
 
 # Gazebo topics (the plugin namespaces them twice: <ns>/<camera_name>/...)
 DEFAULT_CAMERAS = {
@@ -137,6 +145,12 @@ class RedBallDetector(Node):
             self.create_timer(1.0, self._hold_head)
             self.get_logger().info(f"holding head at pan={self.head_q[0]:.2f} tilt={self.head_q[1]:.2f} rad")
         self.create_timer(5.0, self._report)
+        folder = save_folder(p("save_dir", "auto").value, "detector") if save_folder else None
+        self.rec = None
+        if folder is not None:
+            self.rec = ImageRecorder(folder, p("save_period", 0.5).value,
+                                     ["wall_time", "stamp", "camera", "pixels", "x", "y", "z", "sphere_fit"])
+            self.get_logger().info(f"saving detections to {folder}")
 
     # ── callbacks ───────────────────────────────────────────────────────────
     def _info_cb(self, cam, msg: CameraInfo):
@@ -152,6 +166,14 @@ class RedBallDetector(Node):
         pt.time_from_start.sec = 1
         traj.points.append(pt)
         self.head_pub.publish(traj)
+
+    def _record(self, cam, msg, rgb, mask, xs, ys, p, fitted):
+        import time
+        st = msg.header.stamp
+        self.rec.log([f"{time.time():.3f}", f"{st.sec}.{st.nanosec:09d}", cam, int(mask.sum()),
+                      *(f"{v:.4f}" for v in p), int(fitted)])
+        if self.rec.due():
+            self.rec.save(_annotate(rgb, mask, xs, ys, p, self.target_frame, self.target.name), cam)
 
     def _report(self):
         self.get_logger().info("detections: " + ", ".join(f"{c}={v['n']}" for c, v in self.cams.items()))
@@ -200,12 +222,15 @@ class RedBallDetector(Node):
         top = self.target.center_from_points(pts @ R.T + tr)
         if top is not None:
             p = top
+        c_sph = None
         if self.target.shape == "sphere":
             # sphere fit (known radius) to the depth points of the ball without its rim: at the rim the
             # RealSense mixes ball and background depth ("flying pixels"), which lift the top estimate
             c_sph = sphere_center(depth, mask, K, self.radius, self.min_range, self.max_range)
             if c_sph is not None:
                 p = R @ (R_OPT_TO_XFWD @ c_sph if c["conv"] == "x_forward" else c_sph) + tr
+        if self.rec is not None:
+            self._record(cam, rgb_msg, rgb, mask, xs, ys, p, c_sph is not None)
 
         out = PointStamped()
         out.header.stamp = rgb_msg.header.stamp
@@ -213,6 +238,18 @@ class RedBallDetector(Node):
         out.point.x, out.point.y, out.point.z = (float(v) for v in p)
         self.pub.publish(out)
         c["n"] += 1
+
+
+def _annotate(rgb, mask, xs, ys, p, frame, name):
+    import cv2
+    vis = rgb.copy()
+    vis[mask] = (0.5 * vis[mask] + 0.5 * np.array([0, 255, 0])).astype(np.uint8)
+    u, v = int(np.median(xs)), int(np.median(ys))
+    cv2.drawMarker(vis, (u, v), (255, 0, 255), cv2.MARKER_CROSS, 16, 2)
+    text = f"{name}: {frame} ({p[0]:+.3f}, {p[1]:+.3f}, {p[2]:.3f})  {int(mask.sum())} px"
+    cv2.putText(vis, text, (8, 20), cv2.FONT_HERSHEY_SIMPLEX, 0.55, (255, 255, 255), 3)
+    cv2.putText(vis, text, (8, 20), cv2.FONT_HERSHEY_SIMPLEX, 0.55, (0, 0, 0), 1)
+    return vis
 
 
 def main(args=None):

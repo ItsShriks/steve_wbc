@@ -168,6 +168,27 @@ The 8 poses look at a ball 27 cm inside the table's near edge from 0.36–0.56 m
 ≥ 1.14 m high over the table — `table_reach` puts it only 0.20 m above the table: not with a tool
 mounted.
 
+**Clutter: Grounded SAM detector and Contact-GraspNet** (`steve_perception`, model servers in their
+own conda envs, see [`model_server/README.md`](../steve_perception/steve_perception/model_server/README.md)):
+
+| Launch argument | Values |
+|---|---|
+| `detector` | `hsv` (default; colour threshold of the target profile) \| `gsam` (GroundingDINO + SAM with `gsam_prompt`, sphere fit with the profile's size, ~4.5 Hz) \| `false` |
+| `grasp_backend` | `vgn` (default; one TSDF of the scan views) \| `cgn` (Contact-GraspNet per view on the target's Grounded-SAM mask; the rest of the view is collision context) |
+| `gsam_prompt` | text naming the target, default `red ball` |
+| `save_images` | `true` (default): detections → `detector/`, every grasp scan's views with mask + grasps → `grasp_scan/` in the run's log folder (`~/ros_logs/latest`) \| `false` |
+| `model_servers` | `auto` (start the servers `gsam` / `cgn` need) \| `false` (already running: `ros2 run steve_perception model_server gsam\|cgn`) |
+
+```bash
+ros2 launch steve_wbc active_perception_wbc.launch.py use_sim_time:=false launch_bringup:=false \
+    table:=lab_table target:=my_ball detector_cameras:=gripper_camera vgn:=true goto_grasp_only:=true \
+    detector:=gsam grasp_backend:=cgn gsam_prompt:="red ball" \
+    extra_args:="--camera_tilt 25 --max_base_v 0.10 --max_arm_vel 0.3 --grasp_dz 0.05 --state_timeout 0.5"
+```
+
+As with VGN, the scan's grasp decides go / explore another side (`--vgn_explore`) and, with
+`--vgn_orientation yaw`, the gripper yaw; the approach stays top-down at the tracked position.
+
 **`vgn_grasp_real`** (one grasp for `steve_figure8_wbc --goto_file`): camera found automatically
 (gripper first), the table top measured in the view (dominant horizontal plane, saved as table model
 `seen_table` for the WBC's collision checks; `--table` for a model), VGN's 30 cm TSDF placed as in its

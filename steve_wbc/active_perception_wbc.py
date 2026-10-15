@@ -91,6 +91,15 @@ except ImportError:  # steve_perception not built (e.g. plain script): use the s
     sys.path.insert(0, str(Path(__file__).resolve().parents[2] / "steve_perception"))
     from steve_perception.vgn import VGNBridge
 
+
+def make_grasp_backend(a, target):
+    """The grasp scan's detector (--grasp_backend): VGN (TSDF of all views, vgn_env subprocess) or
+    Contact-GraspNet per view on the target's Grounded-SAM mask (model servers, robot only)."""
+    if a.grasp_backend == "cgn":
+        from steve_perception.cgn import CGNBridge
+        return CGNBridge(a.grasp_prompt, target.radius, a.gsam_server, a.cgn_server)
+    return VGNBridge()
+
 # ── Arm poses ────────────────────────────────────────────────────────────────
 DRIVE_POSE = [0.0, -1.5708, 1.5708, -1.5708, -1.5708, 0.0]   # retracted for driving
 SCAN_SEED_Q = [0.0, -1.8, 1.4, -1.2, -1.57, 0.0]             # forward-looking wide-FOV scan
@@ -218,6 +227,18 @@ class VGNInference:
     returned with the result, so the caller can charge it to simulation time."""
     vgn = None
     vgn_target = None  # (position) VGN grasps must lie near, in the TSDF frame
+    save_dir = None    # robot: <run folder>/grasp_scan (--save_dir): every scan's views + grasps as images
+    scan_no = 0
+
+    def _save_scan(self, best):
+        if self.save_dir is None or not hasattr(self.vgn, "save_scan"):
+            return
+        self.scan_no += 1
+        try:
+            self.vgn.save_scan(self.save_dir, self.scan_no, best)
+            print(f"  grasp scan {self.scan_no} saved: {self.save_dir}/scan{self.scan_no:02d}_*")
+        except Exception as e:  # a record must never stop the robot
+            print(f"  [WARN] grasp scan {self.scan_no} not saved: {type(e).__name__}: {e}")
 
     def vgn_available(self):
         return self.vgn is not None and self.vgn.available
@@ -229,7 +250,10 @@ class VGNInference:
         """Blocking: (grasp or None, inference duration [s])."""
         t0 = time.monotonic()
         ok = self.vgn.run_inference()
-        return (self.vgn.best_grasp_world(*self._vgn_near()) if ok else None), time.monotonic() - t0
+        best = self.vgn.best_grasp_world(*self._vgn_near()) if ok else None
+        dur = time.monotonic() - t0
+        self._save_scan(best)
+        return best, dur
 
     def vgn_start(self):
         """Non-blocking: start inference in the background. False if it cannot start."""
@@ -241,7 +265,10 @@ class VGNInference:
         r = self.vgn.poll_inference()
         if r is None:
             return None
-        return (self.vgn.best_grasp_world(*self._vgn_near()) if r else None), time.monotonic() - self._vgn_t0
+        best = self.vgn.best_grasp_world(*self._vgn_near()) if r else None
+        dur = time.monotonic() - self._vgn_t0
+        self._save_scan(best)
+        return best, dur
 
     def _vgn_near(self):
         """Only VGN grasps on the target object: within its radius + 3 cm horizontally and
@@ -264,6 +291,8 @@ class SimWorld(VGNInference):
         self.target = TargetProfile.load(args.target)  # what the detector looks for
         self.half_h = 0.025  # sphere radius / cube half-size (geom size below)
         self.vgn_target = None  # (position, xy radius, z window) VGN grasps must lie in
+        if args.grasp_backend != "vgn" and not args.no_vgn:
+            sys.exit(f"--grasp_backend {args.grasp_backend}: robot / Gazebo only (--mode ros); MuJoCo uses VGN")
         self.vgn = VGNBridge() if not args.no_vgn else None
         self._place_object()
         # Obstacle contact monitor: any contact between a robot geom and an obstacle fails the run
@@ -422,13 +451,18 @@ class WristDepthGrabber:
     height of an approximate camera mount are corrected, x/y are not observable from a plane."""
 
     SFX = "/aligned_depth_to_color"
+    RGB_WAIT = 0.3  # s a view waits for an optional colour frame after its depth frame
 
-    def __init__(self, node, tf, args, table):
+    def __init__(self, node, tf, args, table, rgb=False, rgb_required=False):
         from sensor_msgs.msg import CameraInfo
         self.node, self.tf, self.a, self.table = node, tf, args, table
         self.log = node.get_logger()
         self.ns = args.vgn_camera
         self.K, self.frame_id, self._sub, self._t_req, self._got = None, None, None, None, None
+        # rgb: also a colour frame per view (<ns>/color/image_raw, same pixels as the aligned depth);
+        # rgb_required: the view waits for it (CGN's target mask), else up to RGB_WAIT after the depth
+        self.want_rgb, self.rgb_required = rgb or rgb_required, rgb_required
+        self._rgb_sub, self._rgb_got, self.rgb, self._got_t = None, None, None, None
         self._info_sub = None
         if self.ns != "auto":
             self._info_sub = node.create_subscription(CameraInfo, f"{self.ns}{self.SFX}/camera_info",
@@ -455,7 +489,11 @@ class WristDepthGrabber:
     def _depth_cb(self, m):
         # _t_req None: no frame requested (between views, the subscription stays alive)
         if self._got is None and self._t_req is not None and time.monotonic() >= self._t_req:
-            self._got = m
+            self._got, self._got_t = m, time.monotonic()
+
+    def _rgb_cb(self, m):
+        if self._rgb_got is None and self._t_req is not None and time.monotonic() >= self._t_req:
+            self._rgb_got = m
 
     def request(self):
         """Start (or keep) the image subscription; only frames arriving from now on count."""
@@ -463,22 +501,41 @@ class WristDepthGrabber:
         from sensor_msgs.msg import Image
         if not self._resolve():
             return
-        self._t_req, self._got = time.monotonic() + 0.1, None  # frames already in flight: older
+        self._t_req, self._got, self._rgb_got = time.monotonic() + 0.1, None, None  # in flight: older
         if self._sub is None:
             self._sub = self.node.create_subscription(Image, f"{self.ns}{self.SFX}/image_raw", self._depth_cb,
                                                       qos_profile_sensor_data)
+        if self.want_rgb and self._rgb_sub is None:
+            self._rgb_sub = self.node.create_subscription(Image, f"{self.ns}/color/image_raw", self._rgb_cb,
+                                                          qos_profile_sensor_data)
 
     def stop(self):
         if self._sub is not None:
             self.node.destroy_subscription(self._sub)
             self._sub = None
+        if self._rgb_sub is not None:
+            self.node.destroy_subscription(self._rgb_sub)
+            self._rgb_sub = None
 
     def poll(self):
-        """(depth [m], R_world_optical, t_world_optical, K) once a fresh frame + TF are there, else None."""
+        """(depth [m], R_world_optical, t_world_optical, K) once a fresh frame + TF are there, else None.
+        With rgb: also a fresh colour frame, left in self.rgb (HxWx3 RGB uint8)."""
         m = self._got
         if m is None or self.K is None:
             return None
+        if self.want_rgb and self._rgb_got is None and (
+                self.rgb_required or time.monotonic() - self._got_t < self.RGB_WAIT):
+            return None
         self._got = None
+        self.rgb = None
+        if self.want_rgb and self._rgb_got is not None:
+            c, self._rgb_got = self._rgb_got, None
+            ch = {"rgb8": 3, "bgr8": 3, "rgba8": 4, "bgra8": 4}.get(c.encoding)
+            if ch is None:
+                self.log.warn(f"colour encoding {c.encoding}: no image for the target mask")
+            else:
+                img = np.frombuffer(c.data, np.uint8).reshape(c.height, c.step // ch, ch)[:, :c.width, :3]
+                self.rgb = np.ascontiguousarray(img[:, :, ::-1] if c.encoding.startswith("bgr") else img)
         if m.encoding in ("16UC1", "mono16"):
             d = np.frombuffer(m.data, np.uint16).reshape(m.height, m.width).astype(np.float32) / 1000.0
         else:
@@ -552,8 +609,12 @@ class RosWorld(VGNInference):
         # VGN: runs on this PC (vgn_env), views from the real wrist camera
         self.table = table
         self.target = TargetProfile.load(args.target)  # object size for the grasp filter
-        self.vgn = VGNBridge() if not args.no_vgn else None
-        self._depth = WristDepthGrabber(node, self._tf, args, table) if self.vgn is not None else None
+        self.vgn = make_grasp_backend(args, self.target) if not args.no_vgn else None
+        from steve_perception.utils.run_record import save_folder
+        self.save_dir = save_folder(args.save_dir, "grasp_scan") if self.vgn is not None else None
+        self._depth = (WristDepthGrabber(node, self._tf, args, table, rgb=self.save_dir is not None,
+                                         rgb_required=args.grasp_backend == "cgn")
+                       if self.vgn is not None else None)
         if self.vgn is not None and self.vgn.available:
             self.vgn.start_health_check()
 
@@ -578,7 +639,7 @@ class RosWorld(VGNInference):
         d, R, t, K = r
         if obj_shift is not None:  # object moved / odometry drifted since the TSDF was set up
             t = t - np.asarray(obj_shift, float)
-        n = self.vgn.add_real_view(d, t, R, K, center)
+        n = self.vgn.add_real_view(d, t, R, K, center, rgb=self._depth.rgb)
         self._depth._t_req = None   # the next call requests the next frame
         return n
 
@@ -1655,7 +1716,7 @@ class ActivePerceptionWBC:
         safety = make_safety(self.b, a)
         stop_t0 = None  # start of the current safety stop
         print(f"\n{'═' * 74}\n  Steve active perception + grasping — unified joint-velocity WBC  [{a.mode}]"
-              f"\n{'═' * 74}\n  VGN: {'on' if self.w.vgn_available() else 'off'}   object: "
+              f"\n{'═' * 74}\n  VGN: {('on' + ('' if a.grasp_backend == 'vgn' else f' ({a.grasp_backend})')) if self.w.vgn_available() else 'off'}   object: "
               f"{getattr(a, 'object_type', '-')}   collision env: {a.collision_env}")
 
         try:
@@ -1838,6 +1899,17 @@ def main(argv=None):
                    help="sim object speed along +y [m/s] (default: 0.02; clutter scene: 0)")
     g.add_argument("--no_vgn", action="store_true", help="skip the VGN scan (coarse position, top-down)")
     g.add_argument("--vgn_views", type=int, default=4)
+    g.add_argument("--grasp_backend", choices=["vgn", "cgn"], default="vgn",
+                   help="grasp detector of the scan: vgn (one TSDF of all views, vgn_env) | cgn (robot: "
+                        "Contact-GraspNet per view on the target's Grounded-SAM mask; model servers "
+                        "`ros2 run steve_perception model_server gsam|cgn`, started by the launch file)")
+    g.add_argument("--grasp_prompt", default="red ball", help="cgn: text prompt naming the target (Grounded SAM)")
+    g.add_argument("--gsam_server", default="tcp://127.0.0.1:5556", help="cgn: Grounded-SAM model server")
+    g.add_argument("--cgn_server", default="tcp://127.0.0.1:5555", help="cgn: Contact-GraspNet model server")
+    g.add_argument("--save_dir", default="auto",
+                   help="robot: save every grasp scan (views with target mask + grasps, .jpg/.npz) to "
+                        "<dir>/grasp_scan — auto: the launch's log folder ($STEVE_LAUNCH_LOG_DIR) or "
+                        "~/ros_logs/perception_<time>; '' : off")
     g.add_argument("--vgn_mode", choices=["scan", "async", "drive"], default="scan",
                    help="scan: stop, scan, wait for inference (original) | async: same scan, inference "
                         "in the background | drive: views while driving up, inference in the background")
