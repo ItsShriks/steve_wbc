@@ -1373,7 +1373,7 @@ class ActivePerceptionWBC:
             self._enter("PRE_GRASP", f"{why}; VGN already {'running' if self.vgn_pending else 'done'}")
         elif self.w.vgn_available():
             have = self.w.vgn_n_views() if self.vgn_t0 is not None else 0
-            if self.a.vgn_mode == "drive" and have >= VGN_DRIVE_MIN_VIEWS:
+            if self.a.vgn_mode == "drive" and have >= self._drive_views()[0]:
                 self._vgn_launch()
                 self._enter("PRE_GRASP", f"{why}; {have} VGN views from the drive, inference in the background")
                 return
@@ -1429,18 +1429,25 @@ class ActivePerceptionWBC:
         self.vgn_last_view = (self.t, st.base[:2].copy())
         return n
 
+    def _drive_views(self):
+        """drive mode: (views that let the robot skip the stopped scan, views that start inference
+        while still driving) — --vgn_views if given (1: the first good view starts it), else 3 / 6."""
+        n_max = self.a.vgn_views if self.a.vgn_views_given else VGN_DRIVE_MAX_VIEWS
+        return min(VGN_DRIVE_MIN_VIEWS, n_max), n_max
+
     def _drive_vgn_views(self, st):
         """drive mode: arm posture while driving, taking VGN views once the object is near."""
         if not self._tracked():
             return DRIVE_POSE
         obj = self.tracker.predict(self.t)
-        if np.linalg.norm(obj[:2] - st.base[:2]) > VGN_DRIVE_RANGE:
+        if np.linalg.norm(obj[:2] - st.base[:2]) > self.a.vgn_drive_range:
             return DRIVE_POSE
         q = list(SCAN_SEED_Q)
         q[0] = self._pan_to(st, obj)
         n = self.w.vgn_n_views() if self.vgn_t0 is not None else 0
         ready = np.max(np.abs(np.asarray(q) - st.q)) < VGN_ARM_READY
-        if ready and n < VGN_DRIVE_MAX_VIEWS:
+        n_min, n_max = self._drive_views()
+        if ready and n < n_max:
             last = self.vgn_last_view
             if (last is None or np.linalg.norm(st.base[:2] - last[1]) >= VGN_DRIVE_SPACING
                     or self.t - last[0] >= VGN_DRIVE_PERIOD):
@@ -1451,7 +1458,7 @@ class ActivePerceptionWBC:
                     return q
                 print(f"  VGN view {n} while driving (object {np.linalg.norm(obj[:2] - st.base[:2]):.2f} m "
                       f"from the base)")
-                if n >= VGN_DRIVE_MAX_VIEWS and not self.vgn_pending and self.vgn_result is None:
+                if n >= n_max and not self.vgn_pending and self.vgn_result is None:
                     self._vgn_launch()  # while still driving
         return q
 
@@ -1744,7 +1751,7 @@ class ActivePerceptionWBC:
         safety = make_safety(self.b, a)
         stop_t0 = None  # start of the current safety stop
         print(f"\n{'═' * 74}\n  Steve active perception + grasping — unified joint-velocity WBC  [{a.mode}]"
-              f"\n{'═' * 74}\n  VGN: {('on' + ('' if a.grasp_backend == 'vgn' else f' ({a.grasp_backend})')) if self.w.vgn_available() else 'off'}   object: "
+              f"\n{'═' * 74}\n  VGN: {('on' + ('' if a.grasp_backend == 'vgn' else f' ({a.grasp_backend})')) if self.w.vgn_available() else 'starting (environment check)' if self.w.vgn_checking() else 'off'}   object: "
               f"{getattr(a, 'object_type', '-')}   collision env: {a.collision_env}")
 
         try:
@@ -1926,7 +1933,12 @@ def main(argv=None):
     g.add_argument("--object_speed", type=float, default=None,
                    help="sim object speed along +y [m/s] (default: 0.02; clutter scene: 0)")
     g.add_argument("--no_vgn", action="store_true", help="skip the VGN scan (coarse position, top-down)")
-    g.add_argument("--vgn_views", type=int, default=4)
+    g.add_argument("--vgn_views", type=int, default=None,
+                   help="views per grasp scan (default 4); drive mode: inference starts once this many are "
+                        "taken while driving (default 6) — 1: as soon as the object is in view and in range")
+    g.add_argument("--vgn_drive_range", type=float, default=VGN_DRIVE_RANGE,
+                   help="drive mode: base-object distance below which views are taken while driving [m] "
+                        "(real D415: ~1.2, its depth gets coarse farther away)")
     g.add_argument("--grasp_backend", choices=["vgn", "cgn"], default="vgn",
                    help="grasp detector of the scan: vgn (one TSDF of all views, vgn_env) | cgn (robot: "
                         "Contact-GraspNet per view on the target's Grounded-SAM mask; model servers "
@@ -1994,6 +2006,8 @@ def main(argv=None):
     g.add_argument("--grip_effort", type=float, default=50.0)
     p.set_defaults(sim_q0=DRIVE_POSE, max_base_v=0.30, max_base_w=0.50, max_arm_vel=0.8, grasp_dz=-0.015)
     a = parse_args(argv, p)
+    a.vgn_views_given = a.vgn_views is not None
+    a.vgn_views = a.vgn_views if a.vgn_views_given else 4
     save_console(a.mode)
     if a.mode == "kin":
         sys.exit("active_perception_wbc needs perception: use --mode sim or --mode ros")

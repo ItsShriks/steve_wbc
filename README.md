@@ -96,7 +96,17 @@ the real robot.
 
   Inference time is charged 1:1 to simulation time, so the modes compare fairly
   (`python3 test/compare_vgn_modes.py`). A result arriving after the descent started is ignored;
-  `--vgn_max_wait` bounds a hover at the pre-grasp.
+  `--vgn_max_wait` bounds a hover at the pre-grasp. On the robot the scan's inference always runs in
+  the background (the robot holds in `VGN_WAIT`; a blocking call stalls the state feedback), and VGN
+  runs in a **persistent worker** started with the WBC (~3 s while it drives; then ~0.1 s per inference
+  instead of ~4–7 s for a new process).
+
+  **Fastest** (2026-10-15, sim with a static ball: robot waits 10.3 s with 4 views → 3.6 s with 1 →
+  1.2 s with `drive` + 1 view): `vgn_mode:=drive extra_args:="... --vgn_views 1 --vgn_drive_range 1.2"`
+  — inference starts at the first good view while the robot still drives (`--vgn_views`: views that
+  start it, default 6 in `drive`, 4 in `scan`; `--vgn_drive_range`: base–object distance for drive views,
+  default 2.3 m, ~1.2 m for the D415's depth). No drive view (arm not yet in scan pose): a stopped
+  1-view scan instead.
 * **Go to the grasp pose only** (`--goto_grasp_only`, launch `goto_grasp_only:=true`; no gripper on
   the arm): after the descent the EE stays at the grasp pose with the object (static or moving) for
   `--hold_time`, never closes a gripper or lifts, then backs up to the pre-grasp height

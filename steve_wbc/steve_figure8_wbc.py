@@ -1284,24 +1284,47 @@ class RosBackend(Backend):
         self.switch_cli = None
         self.switched = False
         if args.arm_interface == "velocity" and args.switch_controllers:
-            from controller_manager_msgs.srv import SwitchController
-            self.SwitchController = SwitchController
+            from controller_manager_msgs.srv import ListControllers, SwitchController
+            self.SwitchController, self.ListControllers = SwitchController, ListControllers
             self.switch_cli = self.node.create_client(
                 SwitchController, f"{args.controller_manager}/switch_controller")
+            self.list_cli = self.node.create_client(
+                ListControllers, f"{args.controller_manager}/list_controllers")
 
         self._t_next = None
 
+    def _controller_states(self):
+        """{name: state} from the controller manager, or None if it does not answer."""
+        if not self.list_cli.wait_for_service(timeout_sec=3.0):
+            return None
+        fut = self.list_cli.call_async(self.ListControllers.Request())
+        self.rclpy.spin_until_future_complete(self.node, fut, timeout_sec=3.0)
+        if not fut.done() or fut.result() is None:
+            return None
+        return {c.name: c.state for c in fut.result().controller}
+
     def _switch(self, activate, deactivate):
-        """Synchronous controller switch (STRICT); True on success."""
+        """Synchronous controller switch (STRICT); True on success. Only what is needed is requested:
+        a STRICT request to deactivate a controller that is not active fails as a whole, so a
+        state left over from an earlier run (e.g. both arm controllers inactive after a failed
+        switch-back) would otherwise block every start."""
         if not self.switch_cli.wait_for_service(timeout_sec=3.0):
             self.log.error("controller_manager/switch_controller not available")
             return False
-        req = self.SwitchController.Request(activate_controllers=[activate],
-                                            deactivate_controllers=[deactivate], strictness=2)
+        states = self._controller_states() or {}  # unknown: request both, as before
+        act = [] if states.get(activate) == "active" else [activate]
+        deact = [deactivate] if states.get(deactivate, "active") == "active" else []
+        if not act and not deact:
+            self.log.info(f"controllers: {activate} already active")
+            return True
+        req = self.SwitchController.Request(activate_controllers=act, deactivate_controllers=deact,
+                                            strictness=2)
         fut = self.switch_cli.call_async(req)
         self.rclpy.spin_until_future_complete(self.node, fut, timeout_sec=3.0)
         ok = fut.done() and fut.result() is not None and fut.result().ok
-        self.log.info(f"controllers: {deactivate} -> {activate}: {'ok' if ok else 'FAILED'}")
+        was = ", ".join(f"{n} {states.get(n, '?')}" for n in (deactivate, activate))
+        self.log.info(f"controllers: {deactivate} -> {activate}: {'ok' if ok else 'FAILED'}"
+                      + ("" if ok or not states else f" (before: {was})"))
         return ok
 
     # Callbacks ─────────────────────────────────────────────────────────────
