@@ -55,6 +55,7 @@ Run
   ros2 launch steve_wbc active_perception_wbc.launch.py use_sim_time:=false dry_run:=true
 """
 
+import os
 import sys
 import time
 from pathlib import Path
@@ -452,7 +453,8 @@ class WristDepthGrabber:
         return True
 
     def _depth_cb(self, m):
-        if self._got is None and time.monotonic() >= self._t_req:
+        # _t_req None: no frame requested (between views, the subscription stays alive)
+        if self._got is None and self._t_req is not None and time.monotonic() >= self._t_req:
             self._got = m
 
     def request(self):
@@ -1780,6 +1782,39 @@ class ActivePerceptionWBC:
         return 0 if self.result in ("success", "done", GOTO_DONE) else 1
 
 
+class _Tee:
+    """Console output also to a file (the run's states, decisions and result stay available)."""
+
+    def __init__(self, stream, f):
+        self.stream, self.f = stream, f
+
+    def write(self, data):
+        self.stream.write(data)
+        self.f.write(data)
+        self.f.flush()
+
+    def flush(self):
+        self.stream.flush()
+
+    def __getattr__(self, name):
+        return getattr(self.stream, name)
+
+
+def save_console(mode):
+    """--mode ros: tee stdout + stderr to ~/ros_logs/active_perception/<time>.log — for `ros2 run`;
+    under `ros2 launch` the workspace's logging hook already saves the output
+    (~/ros_logs/<launch file>_<time>/, see steve_hardware_bringup/env-hooks)."""
+    if mode != "ros" or os.environ.get("STEVE_LAUNCH_LOG_DIR"):
+        return
+    d = Path.home() / "ros_logs" / "active_perception"
+    d.mkdir(parents=True, exist_ok=True)
+    path = d / f"{time.strftime('%Y%m%d_%H%M%S')}.log"
+    f = open(path, "w", buffering=1)
+    f.write(f"# {' '.join(sys.argv)}\n")
+    sys.stdout, sys.stderr = _Tee(sys.stdout, f), _Tee(sys.stderr, f)
+    print(f"console output also saved to {path}")
+
+
 def main(argv=None):
     p = build_arg_parser("Steve active perception + VGN grasping — unified joint-velocity WBC")
     g = p.add_argument_group("active perception")
@@ -1859,6 +1894,7 @@ def main(argv=None):
     g.add_argument("--grip_effort", type=float, default=50.0)
     p.set_defaults(sim_q0=DRIVE_POSE, max_base_v=0.30, max_base_w=0.50, max_arm_vel=0.8, grasp_dz=-0.015)
     a = parse_args(argv, p)
+    save_console(a.mode)
     if a.mode == "kin":
         sys.exit("active_perception_wbc needs perception: use --mode sim or --mode ros")
     static_cube = a.scene in ("clutter", "far")

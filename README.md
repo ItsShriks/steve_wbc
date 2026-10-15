@@ -224,7 +224,7 @@ ros2 launch steve_wbc figure8_wbc_demo.launch.py phase:=1 loops:=2
 
 | Step | Tool | Result |
 |---|---|---|
-| 1. Network, USB devices, camera serials | `ros2 run steve_hardware_bringup steve_doctor [--ros]` | checks `steve_hardware_bringup/config/robot_config.yaml` against the hardware ([details](../steve_hardware_bringup/README.md)) |
+| 1. Network, USB devices, camera serials | `ros2 run steve_hardware_bringup steve_doctor ` | checks `steve_hardware_bringup/config/robot_config.yaml` against the hardware ([details](../steve_hardware_bringup/README.md)) |
 | 2. Target object | `ros2 run steve_wbc target_calibrator --name my_ball --size 0.06` | `config/targets/my_ball.yaml` |
 | 3. Table | `ros2 run steve_wbc table_probe --name lab_table` | `config/tables/lab_table.yaml` + debug plot |
 | 4. Try it in MuJoCo with the same table | `ros2 launch steve_wbc active_perception_wbc.launch.py table:=lab_table` | |

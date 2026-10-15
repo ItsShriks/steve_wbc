@@ -38,6 +38,10 @@ except ImportError:
     from steve_manipulation.safety_stop import SCAN_TOPICS, FOOTPRINT_MAX, FOOTPRINT_MIN, D_SAFE, ScanPoints
 
 HEAD = "/pan_tilt_camera/pan_tilt_camera"
+# Known lab table: geometry fixed, only its pose is measured (LiDAR legs) — no camera needed.
+# Height from the earlier depth-camera probe; override with --top_z.
+TABLE_TOP_Z = 0.827
+TABLE_LEGS = 5   # 4 corners + 1 in the middle of one long side
 R_OPT_TO_XFWD = np.array([[0.0, 0.0, 1.0], [-1.0, 0.0, 0.0], [0.0, -1.0, 0.0]])
 
 
@@ -61,10 +65,11 @@ class Probe:
         self._tfl = TransformListener(self.tf, n)
         self.scans = ScanPoints(n, a.lidar_topics, frame="base_link")
         self.K, self.depth = None, None
-        n.create_subscription(CameraInfo, f"{a.camera}/aligned_depth_to_color/camera_info",
-                              lambda m: setattr(self, "K", np.array(m.k).reshape(3, 3)), 10)
-        n.create_subscription(Image, f"{a.camera}/aligned_depth_to_color/image_raw", self._depth,
-                              qos_profile_sensor_data)
+        # camera disabled: table height is hardcoded (TABLE_TOP_Z), the pose comes from the LiDAR
+        # n.create_subscription(CameraInfo, f"{a.camera}/aligned_depth_to_color/camera_info",
+        #                       lambda m: setattr(self, "K", np.array(m.k).reshape(3, 3)), 10)
+        # n.create_subscription(Image, f"{a.camera}/aligned_depth_to_color/image_raw", self._depth,
+        #                       qos_profile_sensor_data)
 
     def _depth(self, msg):
         if msg.encoding in ("16UC1", "mono16"):
@@ -192,11 +197,10 @@ def main(argv=None):
     p.add_argument("--lidar_topics", nargs="+", default=list(SCAN_TOPICS["real"]))
     p.add_argument("--seconds", type=float, default=2.0, help="measurement time")
     p.add_argument("--lidar_only", action="store_true",
-                   help="no camera: find the 4 legs in the LiDAR scan (rectangle in front of the "
-                        "robot, roughly square to it); the top height must be given with --top_z")
-    p.add_argument("--top_z", type=float, default=None,
-                   help="table top height above the floor [m] (--lidar_only; without it the table "
-                        "is only detected and plotted, not saved)")
+                   help="(now the default, kept for compatibility) no camera: find the 4 legs in the "
+                        "LiDAR scan (rectangle in front of the robot, roughly square to it)")
+    p.add_argument("--top_z", type=float, default=TABLE_TOP_Z,
+                   help=f"table top height above the floor [m] (default: hardcoded {TABLE_TOP_Z})")
     p.add_argument("--overhang", type=float, default=0.03, help="top plate beyond the legs [m]")
     p.add_argument("--show", metavar="TABLE",
                    help="only show a saved model in RViz (MarkerArray /table_probe/markers, frame of "
@@ -256,9 +260,9 @@ def main(argv=None):
             print(f"  leg {i} at {np.round(w, 3)}: nearest LiDAR point {d * 100:+.1f} cm "
                   f"{'OK' if abs(d) < 0.05 else '<- model and reality differ (table moved? re-probe)'}")
         info, out = None, tables_dir() / f"{a.check}_check.png"
-    elif a.lidar_only:
+    else:  # LiDAR only, hardcoded top height (was: `elif a.lidar_only:`)
         try:
-            table, info = fit_table_lidar(lidar, robot, a.top_z if a.top_z else 0.75, a.overhang)
+            table, info = fit_table_lidar(lidar, robot, a.top_z, a.overhang)
         except ValueError as e:
             sys.exit(f"[ERROR] {e}")
         table.name, table.frame = a.name, a.frame
@@ -273,31 +277,35 @@ def main(argv=None):
         for i, (e, ctr, yaw) in enumerate(info["candidates"][1:4], 1):
             print(f"  alternative {i}: centre {ctr[0]:.2f} m ahead {ctr[1]:+.2f} m left, {yaw:+.1f}°, "
                   f"shape error {e * 100:.1f} cm")
+        if len(table.legs) != TABLE_LEGS:
+            print(f"  [WARN] {len(table.legs)} legs found, the lab table has {TABLE_LEGS} — a leg hidden "
+                  f"from the LiDAR? Move the robot so all legs are in view and re-run.")
         info["plane_inliers"] = []
         if a.top_z is None:
             out = tables_dir() / f"{a.name}_lidar_detect.png"
             print("  not saved: give the top height with --top_z <m> to save the model")
         else:
-            table.notes = f"table_probe --lidar_only {time.strftime('%Y-%m-%d %H:%M')}: top_z given"
+            table.notes = f"table_probe --lidar_only {time.strftime('%Y-%m-%d %H:%M')}: top_z {a.top_z}"
             path = table.save()
             print(f"saved {path}")
             out = path.with_suffix(".png")
-    else:
-        try:
-            table, info = fit_table(cloud, lidar, robot[0])
-        except ValueError as e:
-            sys.exit(f"[ERROR] {e}")
-        table.name, table.frame = a.name, a.frame
-        table.notes = (f"table_probe {time.strftime('%Y-%m-%d %H:%M')}: {len(info['plane_inliers'])} top "
-                       f"points, {len(info['lidar_under'])} LiDAR points under the top")
-        path = table.save()
-        print(f"saved {path}\n  centre {np.round(table.center, 3)} yaw {np.degrees(table.yaw):.1f}°  "
-              f"size {np.round(table.size, 3)} m  top z {table.top_z:.3f} m  legs {len(table.legs)}  "
-              f"skirt {table.skirt:.2f} m")
-        if not table.legs and not table.skirt:
-            print("  [WARN] no legs seen by the LiDAR — table outside the scan plane? The model still "
-                  "blocks the base via the top plate.")
-        out = path.with_suffix(".png")
+    # camera path (depth RANSAC top plate) — disabled while the table height is hardcoded
+    # else:
+    #     try:
+    #         table, info = fit_table(cloud, lidar, robot[0])
+    #     except ValueError as e:
+    #         sys.exit(f"[ERROR] {e}")
+    #     table.name, table.frame = a.name, a.frame
+    #     table.notes = (f"table_probe {time.strftime('%Y-%m-%d %H:%M')}: {len(info['plane_inliers'])} top "
+    #                    f"points, {len(info['lidar_under'])} LiDAR points under the top")
+    #     path = table.save()
+    #     print(f"saved {path}\n  centre {np.round(table.center, 3)} yaw {np.degrees(table.yaw):.1f}°  "
+    #           f"size {np.round(table.size, 3)} m  top z {table.top_z:.3f} m  legs {len(table.legs)}  "
+    #           f"skirt {table.skirt:.2f} m")
+    #     if not table.legs and not table.skirt:
+    #         print("  [WARN] no legs seen by the LiDAR — table outside the scan plane? The model still "
+    #               "blocks the base via the top plate.")
+    #     out = path.with_suffix(".png")
     fp, _ = footprint(robot)
     clear = min(np.min(np.linalg.norm(table.corners() - q, axis=1)) for q in fp[:4])
     plot(out, table, lidar, info, robot, f"{table.name} ({a.frame}) — robot {clear:.2f} m from the nearest corner")
