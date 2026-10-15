@@ -66,6 +66,23 @@ ARM_TRAJ_TOPIC = {
 WAIT_TIMEOUT = {"gazebo": "120", "real": "15"}
 
 
+def warn_wifi_link():
+    """Robot over Wi-Fi (DDS profile with the robot's Wi-Fi address 10.7.4.213, see ~/.ros/steve_dds.sh):
+    gaps in /odom or /joint_states longer than --state_timeout abort the WBC ("odom stale")."""
+    prof = os.path.expanduser(os.environ.get("FASTRTPS_DEFAULT_PROFILES_FILE", ""))
+    try:
+        txt = open(prof).read() if prof else ""
+    except OSError:
+        txt = ""
+    if os.environ.get("STEVE_ROS_LINK") == "wifi" or "10.7.4.213" in txt:
+        print("\033[1;33m[WARN] active_perception_wbc: ROS to the robot over Wi-Fi (10.7.4.213, "
+              f"{prof or 'no profile'}).\n       State gaps > --state_timeout abort the run (\"odom stale\"): "
+              "plug in Ethernet and open a new terminal (~/.ros/steve_dds.sh picks it).\033[0m")
+    elif "192.168.60.90" not in txt:
+        print(f"[WARN] active_perception_wbc: DDS profile '{prof}' lists neither the robot's Ethernet "
+              "(192.168.60.90) nor Wi-Fi address — is the robot reachable?")
+
+
 def launch_setup(context: LaunchContext):
     cfg = lambda name: LaunchConfiguration(name).perform(context)
     is_sim = cfg("use_sim_time").lower() == "true"
@@ -74,6 +91,8 @@ def launch_setup(context: LaunchContext):
         raise RuntimeError(f"simulator must be 'gazebo' or 'mujoco', got '{simulator}'")
     env = simulator if is_sim else "real"
     print(f"[INFO] active_perception_wbc: environment = {env}")
+    if env == "real":
+        warn_wifi_link()
     actions = []
 
     # --- 1. BRINGUP: robot with gripper + MoveIt-independent gripper controller ---

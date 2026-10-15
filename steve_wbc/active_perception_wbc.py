@@ -57,6 +57,7 @@ Run
 
 import os
 import sys
+import threading
 import time
 from pathlib import Path
 
@@ -231,17 +232,27 @@ class VGNInference:
     scan_no = 0
 
     def _save_scan(self, best):
-        if self.save_dir is None or not hasattr(self.vgn, "save_scan"):
+        if self.save_dir is None or not hasattr(self.vgn, "scan_data"):
             return
         self.scan_no += 1
-        try:
-            self.vgn.save_scan(self.save_dir, self.scan_no, best)
-            print(f"  grasp scan {self.scan_no} saved: {self.save_dir}/scan{self.scan_no:02d}_*")
-        except Exception as e:  # a record must never stop the robot
-            print(f"  [WARN] grasp scan {self.scan_no} not saved: {type(e).__name__}: {e}")
+        n, folder = self.scan_no, self.save_dir
+        views, grasps, name = self.vgn.scan_data()  # references only: the next scan starts new lists
+
+        def write():  # JPEG + compressed npz per view take ~0.1-0.5 s: off the control loop
+            from steve_perception.utils.run_record import save_scan
+            try:
+                save_scan(folder, n, views, grasps, best, name)
+                print(f"  grasp scan {n} saved: {folder}/scan{n:02d}_*")
+            except Exception as e:  # a record must never stop the robot
+                print(f"  [WARN] grasp scan {n} not saved: {type(e).__name__}: {e}")
+        threading.Thread(target=write, name=f"save_scan{n}").start()  # not a daemon: finishes at exit
 
     def vgn_available(self):
         return self.vgn is not None and self.vgn.available
+
+    def vgn_checking(self):
+        """True while a requested grasp detector's environment check is still running."""
+        return self.vgn is not None and self.vgn.available and self.vgn.health(timeout=60.0) is None
 
     def vgn_n_views(self):
         return self.vgn.n_views
@@ -1174,7 +1185,16 @@ class ActivePerceptionWBC:
                 self.vgn_t_start, self.vgn_result, self.vgn_ready_t = t, (None,), t
                 self._enter("VGN_WAIT", "VGN: no depth view could be taken")
                 return None, hold, q
-            if a.vgn_mode == "scan":  # original: run inference and wait for it
+            if a.vgn_mode == "scan" and a.mode == "ros":
+                # robot: the control loop must keep running while VGN works (streamed commands, fresh
+                # robot state: a blocking call of several seconds trips --state_timeout and the drives'
+                # command timeout) -> inference in the background, the robot holds in VGN_WAIT
+                self.vgn_result, self.vgn_used, self.vgn_ready_t = None, False, np.inf
+                self._vgn_launch()
+                if not self.vgn_pending:  # could not start: as if no grasp was found
+                    self.vgn_result, self.vgn_ready_t = (None,), t
+                self._enter("VGN_WAIT", "robot holds until the grasp detector has answered")
+            elif a.vgn_mode == "scan":  # simulation: run inference and wait for it (charged to sim time)
                 print("  running VGN inference ...")
                 self.vgn_t_start = t
                 self.w.vgn_target = self._vgn_target()
@@ -1319,6 +1339,13 @@ class ActivePerceptionWBC:
         return None, BaseReference(st.base.copy(), np.zeros(3)), list(st.q)
 
     def _begin_grasp_planning(self, st, why):
+        if self.w.vgn_checking():
+            # VGN requested but its environment check (vgn_env / model servers) is still running:
+            # wait (the caller retries every tick) rather than silently grasping without it
+            if not self.vgn_check_note:
+                self.vgn_check_note = True
+                print("  waiting for the grasp detector (environment check still running) ...")
+            return
         obj = self.tracker.predict(self.t)
         gt = self.w.ground_truth()
         err = f" | estimate error {np.linalg.norm(obj - gt) * 100:.1f} cm" if gt is not None else ""
@@ -1706,6 +1733,7 @@ class ActivePerceptionWBC:
         self.vgn_views, self.vgn_last_view, self.vgn_wait = {}, None, 0.0
         self.vgn_status, self.vgn_score = "not run", None
         self.vgn_hover_t0, self.vgn_hover_gave_up = None, False
+        self.vgn_check_note = False  # "waiting for the environment check" printed
         self.vgn_center, self.view_wait_t0 = None, None
         self.explored, self.explore_why = [], None  # table sides where VGN found no grasp
         self.hold_slip = 0.0

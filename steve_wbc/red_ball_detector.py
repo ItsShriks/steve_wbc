@@ -110,6 +110,10 @@ class RedBallDetector(Node):
         self.target = TargetProfile.load(p("target", "red").value)
         self.radius = self.target.radius
         self.min_range = p("min_range", 0.12).value
+        # the blob's apparent size must match the object's at the measured depth (within ±tol): closer
+        # than the depth camera's minimum range (D415 ~0.31 m: the gripper camera right above the ball
+        # while grasping) the depth is invalid and the position 15-20 cm off (2026-10-15 runs)
+        self.size_tol = p("size_tolerance", 0.4).value
         self.max_range = p("max_range", 4.0).value
         cameras = p("cameras", list(DEFAULT_CAMERAS)).value
         style = p("topic_style", "gazebo").value  # gazebo | realsense (real robot)
@@ -127,7 +131,7 @@ class RedBallDetector(Node):
             # real RealSense drivers publish proper optical frames; Gazebo's head camera does not
             conv = p(f"{name}.frame", frame_default if style == "gazebo" else "optical").value
             img_t, depth_t, info_t = TOPIC_STYLES[style]
-            self.cams[name] = dict(K=None, conv=conv, n=0)
+            self.cams[name] = dict(K=None, conv=conv, n=0, n_size=0)
             self.create_subscription(CameraInfo, f"{ns}/{info_t}",
                                      lambda m, c=name: self._info_cb(c, m), 10)
             sync = ApproximateTimeSynchronizer(
@@ -176,7 +180,9 @@ class RedBallDetector(Node):
             self.rec.save(_annotate(rgb, mask, xs, ys, p, self.target_frame, self.target.name), cam)
 
     def _report(self):
-        self.get_logger().info("detections: " + ", ".join(f"{c}={v['n']}" for c, v in self.cams.items()))
+        self.get_logger().info("detections: " + ", ".join(
+            f"{c}={v['n']}" + (f" ({v['n_size']} rejected: size does not match the depth)" if v["n_size"] else "")
+            for c, v in self.cams.items()))
 
     def _rgbd_cb(self, cam, rgb_msg: Image, depth_msg: Image):
         c = self.cams[cam]
@@ -191,6 +197,10 @@ class RedBallDetector(Node):
         if len(d) < self.target.min_pixels:
             return
         z = float(np.median(d))
+        ratio = 2.0 * np.sqrt(mask.sum() / np.pi) / (c["K"][0, 0] * self.target.size / z)
+        if abs(ratio - 1.0) > self.size_tol:  # depth not valid for this blob (too close, or not the object)
+            c["n_size"] += 1
+            return
         ys, xs = np.nonzero(mask)
         K = c["K"]
         # blob pixel -> surface point facing the camera -> centre one radius further on
