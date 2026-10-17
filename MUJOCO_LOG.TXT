@@ -1,0 +1,21 @@
+Tue Sep 29 14:47:57 2026
+WARNING: ARB_clip_control unavailable while mjDEPTH_ZEROFAR requested, depth accuracy will be limited
+
+Tue Sep 29 14:48:14 2026
+WARNING: ARB_clip_control unavailable while mjDEPTH_ZEROFAR requested, depth accuracy will be limited
+
+Tue Sep 29 14:48:32 2026
+WARNING: ARB_clip_control unavailable while mjDEPTH_ZEROFAR requested, depth accuracy will be limited
+
+Tue Sep 29 14:49:12 2026
+WARNING: ARB_clip_control unavailable while mjDEPTH_ZEROFAR requested, depth accuracy will be limited
+
+Tue Sep 29 14:50:36 2026
+WARNING: ARB_clip_control unavailable while mjDEPTH_ZEROFAR requested, depth accuracy will be limited
+
+Tue Sep 29 14:50:55 2026
+WARNING: ARB_clip_control unavailable while mjDEPTH_ZEROFAR requested, depth accuracy will be limited
+
+Tue Sep 29 14:51:14 2026
+WARNING: ARB_clip_control unavailable while mjDEPTH_ZEROFAR requested, depth accuracy will be limited
+
