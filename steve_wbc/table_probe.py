@@ -31,10 +31,10 @@ import time
 import numpy as np
 
 try:
-    from steve_wbc.table_model import TableModel, fit_table, fit_table_lidar, tables_dir
+    from steve_wbc.table_model import TableModel, fit_table, fit_table_lidar, fit_table_template, tables_dir
     from steve_manipulation.safety_stop import SCAN_TOPICS, FOOTPRINT_MAX, FOOTPRINT_MIN, D_SAFE, ScanPoints
 except ImportError:
-    from table_model import TableModel, fit_table, fit_table_lidar, tables_dir
+    from table_model import TableModel, fit_table, fit_table_lidar, fit_table_template, tables_dir
     from steve_manipulation.safety_stop import SCAN_TOPICS, FOOTPRINT_MAX, FOOTPRINT_MIN, D_SAFE, ScanPoints
 
 HEAD = "/pan_tilt_camera/pan_tilt_camera"
@@ -202,6 +202,12 @@ def main(argv=None):
     p.add_argument("--top_z", type=float, default=TABLE_TOP_Z,
                    help=f"table top height above the floor [m] (default: hardcoded {TABLE_TOP_Z})")
     p.add_argument("--overhang", type=float, default=0.03, help="top plate beyond the legs [m]")
+    p.add_argument("--template", default=None, metavar="TABLE",
+                   help="known table shape (a saved model, default: --name if it exists): its legs are fitted "
+                        "to any >= 3 visible LiDAR legs, only the pose is measured — a leg hidden behind "
+                        "another one does not matter")
+    p.add_argument("--no_template", action="store_true",
+                   help="measure the shape too: 4 corner legs must be visible (rectangle fit)")
     p.add_argument("--show", metavar="TABLE",
                    help="only show a saved model in RViz (MarkerArray /table_probe/markers, frame of "
                         "the model) until Ctrl+C — no measurement")
@@ -261,23 +267,49 @@ def main(argv=None):
                   f"{'OK' if abs(d) < 0.05 else '<- model and reality differ (table moved? re-probe)'}")
         info, out = None, tables_dir() / f"{a.check}_check.png"
     else:  # LiDAR only, hardcoded top height (was: `elif a.lidar_only:`)
-        try:
-            table, info = fit_table_lidar(lidar, robot, a.top_z, a.overhang)
-        except ValueError as e:
-            sys.exit(f"[ERROR] {e}")
+        template = None
+        if not a.no_template:
+            name = a.template or a.name
+            try:
+                template = TableModel.load(name)
+            except FileNotFoundError:
+                if a.template:
+                    sys.exit(f"[ERROR] template '{name}' not found in {tables_dir()}")
+            if template is not None and len(template.legs) < 3:
+                print(f"template '{name}' has {len(template.legs)} legs -> rectangle fit instead")
+                template = None
+        table = None
+        if template is not None:
+            try:
+                table, info = fit_table_template(lidar, robot, template, a.top_z)
+            except ValueError as e:
+                print(f"[WARN] known shape of '{template.name}': {e} -> rectangle fit (4 corner legs)")
+        if table is None:
+            try:
+                table, info = fit_table_lidar(lidar, robot, a.top_z, a.overhang)
+            except ValueError as e:
+                sys.exit(f"[ERROR] {e}")
         table.name, table.frame = a.name, a.frame
         # in the robot frame (what one would measure with a tape)
         (rx, ry), ryaw = robot
         Rr = np.array([[np.cos(ryaw), -np.sin(ryaw)], [np.sin(ryaw), np.cos(ryaw)]])
         c_r = (np.asarray(table.center) - [rx, ry]) @ Rr
-        print(f"table found (LiDAR, {len(info['leg_like'])} leg-like clusters, shape error "
-              f"{info['shape_err'] * 100:.1f} cm): centre {c_r[0]:.2f} m ahead, {c_r[1]:+.2f} m left, "
-              f"rotated {np.degrees(table.yaw - ryaw):+.1f}°, top {table.size[0]:.2f} x {table.size[1]:.2f} m, "
-              f"{len(table.legs)} legs ({info['extra_legs']} besides the 4 corners)")
-        for i, (e, ctr, yaw) in enumerate(info["candidates"][1:4], 1):
-            print(f"  alternative {i}: centre {ctr[0]:.2f} m ahead {ctr[1]:+.2f} m left, {yaw:+.1f}°, "
-                  f"shape error {e * 100:.1f} cm")
-        if len(table.legs) != TABLE_LEGS:
+        head = (f"known shape of '{template.name}', {info['legs_seen']} of {len(table.legs)} legs seen"
+                + (f" (leg {', '.join(map(str, info['legs_hidden']))} hidden)" if info["legs_hidden"] else "")
+                + f", leg RMS {info['shape_err'] * 100:.1f} cm" if "legs_seen" in info else
+                f"shape error {info['shape_err'] * 100:.1f} cm")
+        print(f"table found (LiDAR, {len(info['leg_like'])} leg-like clusters, {head}): centre {c_r[0]:.2f} m "
+              f"ahead, {c_r[1]:+.2f} m left, rotated {np.degrees(table.yaw - ryaw):+.1f}°, top "
+              f"{table.size[0]:.2f} x {table.size[1]:.2f} m, {len(table.legs)} legs"
+              + (f" ({info['extra_legs']} besides the 4 corners)" if "extra_legs" in info else ""))
+        if info.get("ambiguous"):
+            print("  [WARN] another pose fits as well (too few legs in view?) — check the plot / RViz, or "
+                  "move the robot so more legs are visible and re-run")
+        if "legs_seen" not in info:
+            for i, (e, ctr, yaw) in enumerate(info["candidates"][1:4], 1):
+                print(f"  alternative {i}: centre {ctr[0]:.2f} m ahead {ctr[1]:+.2f} m left, {yaw:+.1f}°, "
+                      f"shape error {e * 100:.1f} cm")
+        if "legs_seen" not in info and len(table.legs) != TABLE_LEGS:
             print(f"  [WARN] {len(table.legs)} legs found, the lab table has {TABLE_LEGS} — a leg hidden "
                   f"from the LiDAR? Move the robot so all legs are in view and re-run.")
         info["plane_inliers"] = []

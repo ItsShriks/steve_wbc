@@ -75,6 +75,7 @@ try:
                                            read_lidar, render_rgbd, unproject_pixel_to_world)
     from steve_wbc.target_profile import TargetProfile
     from steve_wbc.table_model import TableModel
+    from steve_wbc.table_heightmap import TableHeightMap
 except ImportError:  # plain script next to the other modules (e.g. macOS without ROS)
     from steve_figure8_wbc import (
         BASE_LAG_BUFFER, NU, BaseReference, DryRunBackend, MujocoSimBackend, Reference, RosBackend, RobotState,
@@ -85,6 +86,7 @@ except ImportError:  # plain script next to the other modules (e.g. macOS withou
                                  read_lidar, render_rgbd, unproject_pixel_to_world)
     from target_profile import TargetProfile
     from table_model import TableModel
+    from table_heightmap import TableHeightMap
 
 try:
     from steve_perception.vgn import VGNBridge
@@ -155,7 +157,30 @@ STANDOFF_MARGIN = 0.01        # m  base stand-off: footprint this far beyond d_s
 GRASP_ETA = 8.0               # s  from arriving at a side to the grasp (object prediction)
 PREGRASP_TIMEOUT = 12.0       # s  pre-grasp not reached from this side -> replan (another side)
 RING_MARGIN = 0.05            # m  ring around the table: clear at any heading, + this
-REPOSITION_SPEED = 0.25       # m/s along the ring
+REPOSITION_SPEED = 0.25       # m/s along the ring (--orbit_speed; capped by --max_base_v)
+ORBIT_ACC = 0.25              # m/s^2 ramps of repositioning paths (trapezoidal speed; QP limit 0.5)
+
+# ── Continuous operation (--continuous): after an episode the robot watches the table and goes for
+# the object again once it has been put down somewhere else ──
+WATCH_SETTLE = 1.5            # s  a new placement: the object still (within WATCH_STILL_TOL) this long
+WATCH_STILL_TOL = 0.025       # m
+WATCH_RETRACK = 1.0           # s  track not confirmed this long (picked up, carried): start a new track
+WATCH_SEARCH_AFTER = 4.0      # s  nothing tracked this long -> sweep, then search the other sides
+RELEASE_OPEN_WAIT = 1.5       # s  gripper open -> watching
+SIM_RELOCATE_AFTER = 3.0      # s  sim: the object is put somewhere else this long into WATCH
+
+# ── Visibility task (--no_visibility): camera axis kept on the object while the EE is free ──
+VIS_STATES = ("DRIVE", "SETTLE_ARM", "COARSE_DETECT", "REPOSITION", "VGN_SCAN", "VGN_WAIT", "WATCH")
+VIS_READY_DEG = 4.0           # deg camera axis -> object for "arm ready" (settle, scan / drive views)
+VIS_FOV_DEG = 20.0            # deg "object in view" for the summary (D415 colour: 69 x 42 deg FOV)
+
+# ── Occlusion-aware line of sight (--no_los): what stands on the table, from the camera's depth
+# frames (TableHeightMap), chooses the approach side (target not hidden) and feeds the QP's
+# line-of-sight term; an object not found from one side is searched from the others ──
+MAP_STATES = ("DRIVE", "SETTLE_ARM", "COARSE_DETECT", "REPOSITION", "VGN_WAIT")  # VGN_SCAN: its views
+MAP_PERIOD = 0.5              # s  depth frames into the table map
+LOS_OK = 0.6                  # share of clear sight lines: the object counts as visible from a side
+LOS_NEAR = 0.6                # m  map columns within this (xy) of the object enter the QP's LOS term
 # Table quadrants as seen from the side the robot arrives on (bottom = near half, top = far half,
 # left / right from the robot's view) -> side of the table to grasp from. "here" = stay.
 VIEW_TIMEOUT = 3.0            # s  real camera: no depth frame + TF for a VGN view -> skip the view
@@ -186,7 +211,8 @@ SIDES = {  # outward normal of the table side, base yaw facing the table
 #          MuJoCo model) and any robot contact with them fails the run.
 # far    : a red cube near the far edge of the table, out of reach from the front with the base
 #          outside its safety distance -> the robot has to drive around the table
-TARGET_POS = {"single": (2.05, -0.25), "clutter": (2.00, -0.08), "far": (2.32, 0.10)}
+TARGET_POS = {"single": (2.05, -0.25), "clutter": (2.00, -0.08), "far": (2.32, 0.10),
+              "occluded": (2.22, 0.0)}
 CLUTTER_OBSTACLES = [
     # name,        geom type,  size (MuJoCo convention),  centre xyz,              rgba
     # tall bottle (top 1.12 m) between the robot and the cube, on the path the gripper takes
@@ -198,6 +224,15 @@ CLUTTER_OBSTACLES = [
     # block diagonally behind the cube
     ("obst_block",  "box",      (0.030, 0.030, 0.050),    (2.13, -0.19, 0.850), (0.90, 0.80, 0.10, 1)),
 ]
+# occluded: a static ball in the far half of the table behind a 32 cm box (as seen from the front
+# side, where the robot arrives). The wrist camera looks down steeply (front scan pose: x 1.71,
+# z 1.34 m): the sight lines to the ball cross the box at z ~1.02 m, its top is at 1.12 m — hidden
+# from the front, visible from the other sides; 15 cm between box and ball leave the gripper room.
+# Tests: searching another side, the table map, side choice by line of sight.
+OCCLUDED_OBSTACLES = [
+    ("obst_box",    "box",      (0.020, 0.200, 0.160),    (2.07,  0.00, 0.960), (0.55, 0.55, 0.60, 1)),
+]
+SCENE_OBSTACLES = {"clutter": CLUTTER_OBSTACLES, "occluded": OCCLUDED_OBSTACLES}
 
 
 def build_model(path, scene, intruder=False, table=None):
@@ -206,17 +241,17 @@ def build_model(path, scene, intruder=False, table=None):
     def edit(spec):
         if table is not None:
             table.apply_to_spec(spec)
-        if scene == "clutter":
+        if scene in SCENE_OBSTACLES:
             add_obstacles(spec)
 
     def add_obstacles(spec):
         gtype = {"cylinder": mujoco.mjtGeom.mjGEOM_CYLINDER, "box": mujoco.mjtGeom.mjGEOM_BOX,
                  "sphere": mujoco.mjtGeom.mjGEOM_SPHERE}
-        for name, kind, size, pos, rgba in CLUTTER_OBSTACLES:
+        for name, kind, size, pos, rgba in SCENE_OBSTACLES[scene]:
             body = spec.worldbody.add_body(name=name, pos=list(pos))  # no joint: static
             body.add_geom(name=f"{name}_geom", type=gtype[kind], size=[*size, 0, 0][:3], rgba=list(rgba),
                           contype=1, conaffinity=1, friction=[1.0, 0.005, 0.0001])
-    return load_model(path, intruder, edit if (scene == "clutter" or table is not None) else None)
+    return load_model(path, intruder, edit if (scene in SCENE_OBSTACLES or table is not None) else None)
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -305,6 +340,9 @@ class SimWorld(VGNInference):
         if args.grasp_backend != "vgn" and not args.no_vgn:
             sys.exit(f"--grasp_backend {args.grasp_backend}: robot / Gazebo only (--mode ros); MuJoCo uses VGN")
         self.vgn = VGNBridge() if not args.no_vgn else None
+        if args.save_dir not in ("", "auto"):  # simulation: records only into an explicit folder
+            from steve_perception.utils.run_record import save_folder
+            self.save_dir = save_folder(args.save_dir, "grasp_scan")
         self._place_object()
         # Obstacle contact monitor: any contact between a robot geom and an obstacle fails the run
         name = lambda i, t: mujoco.mj_id2name(m, t, i) or ""
@@ -382,6 +420,8 @@ class SimWorld(VGNInference):
         m, d = self.b.model, self.b.data
         mujoco.mj_forward(m, d)
         rgb, depth = render_rgbd(self.renderer, m, d, cam)
+        if cam == self.cfg.cam_name:
+            self._store_map_frame(depth, cam)
         found, cx, cy, blob = self.target.detect(rgb)
         if not found:
             return None
@@ -399,6 +439,32 @@ class SimWorld(VGNInference):
         cam = d.cam_xpos[mujoco.mj_name2id(m, mujoco.mjtObj.mjOBJ_CAMERA, cam)]
         ray = pt - cam
         return pt + self.target.radius * ray / np.linalg.norm(ray)
+
+    save_dir = None  # --save_dir <path>: records (table map, scans) of a simulated run
+
+    def _store_map_frame(self, depth, cam_name):
+        m, d = self.b.model, self.b.data
+        c = mujoco.mj_name2id(m, mujoco.mjtObj.mjOBJ_CAMERA, cam_name)
+        f = 0.5 * IMG_H / np.tan(np.deg2rad(m.cam_fovy[c]) / 2.0)
+        K = np.array([[f, 0.0, IMG_W / 2.0], [0.0, f, IMG_H / 2.0], [0.0, 0.0, 1.0]])
+        R = d.cam_xmat[c].reshape(3, 3) @ np.diag([1.0, -1.0, -1.0])  # MuJoCo camera -> optical frame
+        self._map_frame = (depth.copy(), K, R, d.cam_xpos[c].copy())
+
+    def mapping_frame(self):
+        """The newest perception-camera depth frame for the table map (once), or None."""
+        f, self._map_frame = getattr(self, "_map_frame", None), None
+        return f
+
+    def mapping_stop(self):
+        pass
+
+    def support_top_z(self):
+        m, d = self.b.model, self.b.data
+        g = mujoco.mj_name2id(m, mujoco.mjtObj.mjOBJ_GEOM, "table_top")
+        return None if g < 0 else float(d.geom_xpos[g][2] + m.geom_size[g][2])
+
+    def support_poly(self):
+        return None
 
     def _pixels_to_world(self, cam_name, mask, depth):
         """World points of the mask's pixels (MuJoCo camera: looks along -z, depth along it)."""
@@ -441,6 +507,16 @@ class SimWorld(VGNInference):
 
     def gripper(self, close):
         self.b.data.ctrl[self.grip_act] = 255.0 if close else 0.0
+
+    def relocate(self, xy):
+        """--continuous test: put the object down at xy on the table (at rest)."""
+        m, d = self.b.model, self.b.data
+        j = mujoco.mj_name2id(m, mujoco.mjtObj.mjOBJ_JOINT, "box_joint")
+        qa, va = m.jnt_qposadr[j], m.jnt_dofadr[j]
+        top = self.support_top_z()
+        d.qpos[qa:qa + 7] = [*xy, (0.80 if top is None else top) + self.half_h, 1, 0, 0, 0]
+        d.qvel[va:va + 6] = 0.0
+        mujoco.mj_forward(m, d)
 
     # VGN (simulation only)
     def vgn_init(self, center):
@@ -622,12 +698,55 @@ class RosWorld(VGNInference):
         self.target = TargetProfile.load(args.target)  # object size for the grasp filter
         self.vgn = make_grasp_backend(args, self.target) if not args.no_vgn else None
         from steve_perception.utils.run_record import save_folder
-        self.save_dir = save_folder(args.save_dir, "grasp_scan") if self.vgn is not None else None
+        self.save_dir = save_folder(args.save_dir, "grasp_scan")  # scans + table maps
         self._depth = (WristDepthGrabber(node, self._tf, args, table, rgb=self.save_dir is not None,
                                          rgb_required=args.grasp_backend == "cgn")
                        if self.vgn is not None else None)
         if self.vgn is not None and self.vgn.available:
             self.vgn.start_health_check()
+
+    def mapping_frame(self):
+        """A fresh gripper-camera depth frame for the table map, or None (asked for once, delivered
+        on a later call). No table levelling: a few mm of mount error do not matter at 2 cm cells,
+        and its plane fit would cost the control loop ~50 ms per frame."""
+        g = getattr(self, "_map_grab", None)
+        if g is None:
+            g = self._map_grab = WristDepthGrabber(self.node, self._tf, self.a, None)
+        if g._sub is None or g._t_req is None:
+            g.request()
+            return None
+        r = g.poll()
+        if r is None:
+            return None
+        g._t_req = None
+        d, R, t, K = r
+        return d, K, R, t
+
+    def mapping_stop(self):
+        g = getattr(self, "_map_grab", None)
+        if g is not None:
+            g.stop()
+            g._t_req = None
+
+    def support_top_z(self):
+        return None if getattr(self, "table", None) is None else float(self.table.top_z)
+
+    def support_poly(self):
+        return None if getattr(self, "table", None) is None else self.table.corners()
+
+    def camera_pose(self, frame):
+        """(R, t) of `frame` in odom from the latest TF, or None."""
+        from rclpy.time import Time
+        try:
+            tr = self._tf.lookup_transform("odom", frame, Time())
+        except Exception:
+            return None
+        q, tt = tr.transform.rotation, tr.transform.translation
+        x, y, z, w = q.x, q.y, q.z, q.w
+        R = np.array([[1 - 2 * (y * y + z * z), 2 * (x * y - z * w), 2 * (x * z + y * w)],
+                      [2 * (x * y + z * w), 1 - 2 * (x * x + z * z), 2 * (y * z - x * w)],
+                      [2 * (x * z - y * w), 2 * (y * z + x * w), 1 - 2 * (x * x + y * y)]])
+        return R, np.array([tt.x, tt.y, tt.z])
 
     def vgn_available(self):
         if self.vgn is None:
@@ -651,6 +770,7 @@ class RosWorld(VGNInference):
         if obj_shift is not None:  # object moved / odometry drifted since the TSDF was set up
             t = t - np.asarray(obj_shift, float)
         n = self.vgn.add_real_view(d, t, R, K, center, rgb=self._depth.rgb)
+        self.last_view = (d, K, R, t)  # also into the WBC's table map
         self._depth._t_req = None   # the next call requests the next frame
         return n
 
@@ -983,22 +1103,35 @@ class TableOrbit:
 
 
 class OrbitPath:
-    """Time-parameterised base path (min-jerk along its length): at(t) -> (BaseReference, done)."""
+    """Time-parameterised base path: at(t) -> (BaseReference, done). Trapezoidal speed along its
+    length — ramps of `acc`, cruise at <= v_max: ~0.95 of v_max on average for a 2 m path, where
+    the earlier min-jerk profile averaged 0.53 (2 m at 0.1 m/s: ~21 s instead of 37.5 s)."""
 
-    def __init__(self, pts, yaw, v_max):
+    def __init__(self, pts, yaw, v_max, acc=ORBIT_ACC):
         self.pts, self.yaw = pts, np.asarray(yaw, float)
         self.c = np.concatenate([[0.0], np.cumsum(np.linalg.norm(np.diff(pts, axis=0), axis=1))])
-        self.length = float(self.c[-1])
+        self.length = L = float(self.c[-1])
         turn = float(np.abs(np.diff(self.yaw)).sum())
-        self.T = max(2.0, 1.875 * self.length / v_max, 1.875 * turn / 0.4)   # peak speed v_max, 0.4 rad/s
+        t_lin = 2.0 * np.sqrt(L / acc) if L < v_max ** 2 / acc else L / v_max + v_max / acc
+        self.T = max(2.0, t_lin, turn / 0.4)   # <= v_max, <= 0.4 rad/s on average
+        # cruise speed covering L in T with ramps of acc: v^2/acc - v T + L = 0 (smaller root)
+        self.acc = acc
+        self.v_c = 0.5 * (acc * self.T - np.sqrt(max((acc * self.T) ** 2 - 4.0 * acc * L, 0.0)))
+        self.t_r = self.v_c / acc
 
     def __bool__(self):
         return True
 
     def at(self, t):
-        tau = min(max(t / self.T, 0.0), 1.0)
-        c = self.length * (10 * tau ** 3 - 15 * tau ** 4 + 6 * tau ** 5)
-        dc = self.length * (30 * tau ** 2 - 60 * tau ** 3 + 30 * tau ** 4) / self.T
+        T, a, vc, tr = self.T, self.acc, self.v_c, self.t_r
+        t = min(max(t, 0.0), T)
+        tau = t / T
+        if t < tr:
+            c, dc = 0.5 * a * t * t, a * t
+        elif t < T - tr:
+            c, dc = 0.5 * a * tr * tr + vc * (t - tr), vc
+        else:
+            c, dc = self.length - 0.5 * a * (T - t) ** 2, a * (T - t)
         i = int(np.clip(np.searchsorted(self.c, c) - 1, 0, len(self.c) - 2))
         f = (c - self.c[i]) / max(self.c[i + 1] - self.c[i], 1e-9)
         p = self.pts[i] + f * (self.pts[i + 1] - self.pts[i])
@@ -1031,6 +1164,149 @@ class ActivePerceptionWBC:
         d = rot_z(st.base[2]).T @ (p_world - sh)
         return float(np.arctan2(d[1], d[0]))
 
+    def _setup_camera(self, st):
+        """Camera of the visibility task. MuJoCo: the perception camera of the model; robot: the
+        camera's optical frame from TF (calibrated mount), expressed on the gripper body of the
+        model once at the start (the robot stands still)."""
+        # cam_ok: camera known (its angle to the object is measured either way, for the summary);
+        # vis_on: the visibility task steers it (not with --no_visibility)
+        self.cam_ok = self.vis_on = False
+        self.vis_deg, self.vis_ticks, self.vis_good = None, 0, 0
+        self.still_since = None  # time since which the arm moves < 0.03 rad/s
+        m = self.kin.model
+        if self.sim:
+            name = self.w.cfg.cam_name
+            cid = mujoco.mj_name2id(m, mujoco.mjtObj.mjOBJ_CAMERA, name)
+            if cid < 0:
+                print(f"[visibility] no camera '{name}' in the model -> off")
+                return
+            R = np.zeros(9)
+            mujoco.mju_quat2Mat(R, m.cam_quat[cid])
+            self.kin.set_camera(m.cam_bodyid[cid], m.cam_pos[cid], -R.reshape(3, 3)[:, 2])  # MuJoCo: -z
+            src = f"MuJoCo camera '{name}'"
+        else:
+            pose, t_end = None, time.monotonic() + 10.0
+            while pose is None and time.monotonic() < t_end:
+                pose = self.w.camera_pose(self.a.look_camera_frame)
+                if pose is None:
+                    st = self.b.read_state() or st  # keeps the TF listener fed
+                    time.sleep(0.05)
+            if pose is None:
+                print(f"[visibility] no TF odom -> {self.a.look_camera_frame} within 10 s (camera driver + mount "
+                      "TF running?) -> visibility task off")
+                return
+            R_c, t_c = pose
+            self.kin.set_state(st)
+            b = m.site_bodyid[self.kin.site_id]  # gripper body (the pinch site's): rigid with the flange
+            R_b, p_b = self.kin.data.xmat[b].reshape(3, 3), self.kin.data.xpos[b]
+            self.kin.set_camera(b, R_b.T @ (t_c - p_b), R_b.T @ R_c[:, 2])
+            src = f"'{self.a.look_camera_frame}' from TF"
+        self.kin.set_state(st)
+        c, z, _, _ = self.kin.camera(st.base[2])
+        p_ee, R_ee = self.kin.ee_pose()
+        self.cam_ok, self.vis_on = True, not self.a.no_visibility
+        print(f"[visibility{'' if self.vis_on else ' OFF, angle measured only'}] camera {src}: {np.linalg.norm(c - p_ee) * 100:.0f} cm from the pinch point, axis "
+              f"{np.degrees(np.arccos(np.clip(z @ R_ee[:, 2], -1, 1))):.0f} deg from the approach axis; "
+              f"{'kept on' if self.vis_on else 'angle to'} the object in {', '.join(VIS_STATES)}")
+
+    def _front_clearance(self):
+        """Base clearance ahead: front LiDAR, and the environment model (table) when there is one."""
+        front, coll = self.w.front_distance(), self.ctrl.coll
+        if coll is not None and np.isfinite(getattr(coll, "base_clearance", np.inf)):
+            front = min(front, coll.base_clearance)
+        return front
+
+    def _setup_map(self):
+        """Table map for the occlusion-aware line of sight (needs the camera and a table)."""
+        self.hmap, self.los_pts, self.map_t, self.map_cut, self.searched = None, None, -np.inf, False, []
+        rect = self.w.support_rect()
+        top = self.w.support_top_z() if rect is not None else None
+        if self.a.no_los or not self.cam_ok or top is None:
+            if not self.a.no_los:
+                print("[line of sight] off: needs the camera and a table model (--table)")
+            return
+        self.hmap = TableHeightMap(*rect, top, poly=self.w.support_poly())
+        print(f"[line of sight] table map {self.hmap.n[0]} x {self.hmap.n[1]} cells of {self.hmap.cell * 100:.0f} cm "
+              f"at z {top:.2f} m: approach side by line of sight, sight line kept clear by the QP, an object "
+              f"not found is searched from the other sides")
+
+    def _update_map(self):
+        """Depth frames into the table map while the EE is free (every MAP_PERIOD)."""
+        if self.state not in MAP_STATES:
+            self.w.mapping_stop()
+            return
+        if self.t - self.map_t < MAP_PERIOD:
+            return
+        f = self.w.mapping_frame()
+        if f is not None:
+            self.map_t = self.t
+            self._integrate_map(*f)
+
+    def _integrate_map(self, depth, K, R, t):
+        tgt = self.tracker.predict(self.t) if self.tracker.p is not None else None
+        r = self.w.target.radius + 0.025
+        if tgt is not None and not self.map_cut:  # cells of the object seen before it was tracked
+            self.hmap.forget_target(tgt, r)
+            self.map_cut = True
+        self.hmap.integrate(depth, K, R, t, target=tgt, target_r=r)
+        self.los_pts = self.hmap.occluders(near=tgt, radius=LOS_NEAR) if tgt is not None else None
+
+    def _los_from(self, pose, obj):
+        """Share of clear sight lines from the camera at the scan pose with the base at `pose`."""
+        q = np.array(SCAN_SEED_Q, float)
+        q[0] = self._pan_to(RobotState(pose, q), obj)
+        self.kin.set_state(RobotState(pose, q))
+        c = self.kin.camera(pose[2])[0]
+        return self.hmap.line_of_sight(c, obj, self.w.target.radius), c
+
+    def _standoff(self):
+        return self.a.d_safe_base + BASE_LAG_BUFFER + STANDOFF_MARGIN + self.ctrl.coll.base_xy_max[0]
+
+    def _search_next_side(self, st):
+        """Object not found from here (hidden behind something on the table?): drive around the
+        table to the nearest side not searched yet and look again. False if none is left."""
+        if self.a.no_los or not self._can_plan():
+            return False
+        lo, hi = self.w.support_rect()
+        here = self._side_of(st.base, lo, hi)
+        if here not in self.searched:
+            self.searched.append(here)
+        best, centre = None, 0.5 * (lo + hi)
+        for name in [s for s in SIDES if s not in self.searched]:
+            n, yaw = SIDES[name]
+            xy = np.where(n != 0, np.where(n > 0, hi, lo) + n * self._standoff(), centre)
+            goal = np.array([xy[0], xy[1], yaw])
+            path, length = self._ring_path(st.base, goal, lo, hi)
+            if best is None or length < best[0]:
+                best = (length, name, path)
+        if best is None:
+            return False
+        length, name, path = best
+        self.side, self.base_path = name, path
+        self._enter("REPOSITION", f"object not found from the {here} side"
+                    + (f" (table map: {self.hmap.summary()})" if self.hmap is not None else "")
+                    + f" -> searching from the {name} side ({length:.1f} m)")
+        return True
+
+    def _look_target(self):
+        """Point the camera keeps on its axis: the tracked (static) object, else a fresh glimpse."""
+        if not self.cam_ok or self.state not in VIS_STATES:
+            return None
+        if self.tracker.p is not None and self.t - self.last_seen < self.a.lost_timeout_static:
+            return self.tracker.predict(self.t)
+        if self.glimpse is not None and self.t - self.glimpse[1] < 2.0:
+            return self.glimpse[0]
+        return None
+
+    def _camera_ready(self, still_for=None):
+        """Visibility task on: camera on the object (< VIS_READY_DEG) and, with still_for, the arm
+        still (< 0.03 rad/s) for that long. The posture's joint targets are not waited for: posture
+        and visibility share a QP level and settle on a compromise, so the shoulder pan can stop short
+        of its posture target for good (a 0.03 rad pan condition never fired: sim, 2026-10-15)."""
+        if self.vis_deg is None or self.vis_deg >= VIS_READY_DEG:
+            return False
+        return still_for is None or (self.still_since is not None and self.t - self.still_since >= still_for)
+
     def _tracked(self):
         """Object path known well enough to act on (recent, several detections)."""
         return self.tracker.p is not None and len(self.tracker.hist) >= 5 and self.t - self.last_seen < 1.0
@@ -1050,6 +1326,18 @@ class ActivePerceptionWBC:
         p = self.w.detect(cam)
         if p is None:
             return
+        top = self.w.support_top_z() if self.w.support_rect() is not None else None
+        if top is not None and self.state not in ("LIFT", "HOLD", "RELEASE"):
+            # the object rests on the table: its centre at top + radius. Anything else is a bad
+            # detection (camera closer than its depth range at the grasp pose, partly hidden by the
+            # gripper, ...) — accepted after an occlusion it re-starts the track somewhere wrong
+            dz = p[2] - (top + self.w.target.radius)
+            if abs(dz) > self.a.detect_z_tol:
+                self.n_bad_z += 1
+                if self.n_bad_z in (1, 10, 100) or self.n_bad_z % 500 == 0:
+                    print(f"  detection at z={p[2]:.3f} m ignored: {dz * 100:+.0f} cm from resting on the table "
+                          f"(--detect_z_tol {self.a.detect_z_tol:.2f}; {self.n_bad_z} so far)")
+                return
         # while searching, a camera swung by the arm sees the object biased along the sweep
         # (which the tracker would fit as motion): only a glimpse to turn towards
         if (self.state in ("SETTLE_ARM", "COARSE_DETECT")
@@ -1085,18 +1373,14 @@ class ActivePerceptionWBC:
                 return None, BaseReference(st.base.copy(), np.zeros(3)), list(st.q)
 
         if self.state == "DRIVE":
-            front = self.w.front_distance()
-            coll = self.ctrl.coll
-            if coll is not None and np.isfinite(getattr(coll, "base_clearance", np.inf)):
-                # the table model too: with open legs the LiDAR may see nothing ahead
-                front = min(front, coll.base_clearance)
+            front = self._front_clearance()
             yaw = st.base[2]
             stop_d = a.d_safe_base + LIDAR_STOP_MARGIN
             speed = (a.drive_speed if front > a.d_safe_base + LIDAR_SLOW_MARGIN
                      else SLOW_SPEED if front > stop_d else 0.0)
             travelled = np.linalg.norm(st.base[:2] - self.drive_start[:2])
             if speed == 0.0 or travelled >= a.max_drive:
-                self.base_hold = st.base.copy()
+                self.base_hold, self.backup_start = st.base.copy(), st.base.copy()
                 why = f"LiDAR {front:.3f} m" if front <= stop_d else f"travelled {travelled:.2f} m"
                 self._enter("BACKUP" if front < a.d_safe_base - LIDAR_EMERGENCY_MARGIN else "SETTLE_ARM",
                             why + (f" | object tracked since t={self.tracker.hist[0][0]:.1f} s"
@@ -1106,16 +1390,22 @@ class ActivePerceptionWBC:
             return None, BaseReference(st.base.copy(), np.array([speed * np.cos(yaw), speed * np.sin(yaw), 0.0])), q
 
         if self.state == "BACKUP":
-            if self.w.front_distance() >= a.d_safe_base:
+            # LiDAR and the table model (the LiDARs do not see the top plate): until the base is
+            # clear of both again, at most 0.5 m
+            front = self._front_clearance()
+            backed = np.linalg.norm(st.base[:2] - self.backup_start[:2])
+            if front >= a.d_safe_base + LIDAR_STOP_MARGIN or backed > 0.5:
                 self.base_hold = st.base.copy()
-                self._enter("SETTLE_ARM", "clearance restored")
+                self._enter("SETTLE_ARM", f"clearance {front * 100:.0f} cm restored" if front >= a.d_safe_base
+                            + LIDAR_STOP_MARGIN else f"[WARN] backed up {backed:.2f} m, clearance still only "
+                                                     f"{front * 100:.0f} cm (< {a.d_safe_base * 100:.0f} cm)")
                 return None, BaseReference(self.base_hold, np.zeros(3)), DRIVE_POSE
             yaw = st.base[2]
             return None, BaseReference(st.base.copy(), -BACKUP_SPEED * np.array([np.cos(yaw), np.sin(yaw), 0.0])), DRIVE_POSE
 
         if self.state == "REPOSITION":
             # drive around the table on a smooth orbit (TableOrbit: rounded ring, facing the table,
-            # min-jerk speed; arm tucked) — the WBC's base task tracks pose + velocity feed-forward,
+            # trapezoidal speed; arm tucked) — the WBC's base task tracks pose + velocity feed-forward,
             # the QP's base constraint still guards d_safe_base. The orbit clock is the state time
             # (t_state skips safety stops), so the reference waits during a stop.
             if not self.base_path:
@@ -1137,9 +1427,12 @@ class ActivePerceptionWBC:
             if self.tracker.p is not None:  # look at where the object is predicted to be
                 q[0] = self._pan_to(st, self.tracker.predict(t))
             # the pan target follows the moving object, so allow residual motion
-            if (self._settled(st, q, tol=0.04) and np.max(np.abs(self.u_prev)) < 0.06) or ts > 6.0:
+            ready = (self._camera_ready(still_for=0.3) and np.max(np.abs(self.u_prev)) < 0.06
+                     if self.vis_deg is not None else
+                     self._settled(st, q, tol=0.04) and np.max(np.abs(self.u_prev)) < 0.06)
+            if ready or ts > 6.0:
                 if self._tracked():
-                    self._begin_grasp_planning(st, "object path known from perception since the start")
+                    self._object_found(st, "object path known from perception since the start")
                 else:
                     self.pan_cmd, self.pan_dir = st.q[0], -1.0
                     self._enter("COARSE_DETECT", "object not tracked yet -> sweeping shoulder_pan")
@@ -1159,16 +1452,20 @@ class ActivePerceptionWBC:
             q = list(SCAN_SEED_Q)
             q[0] = self.pan_cmd
             if self._tracked():
-                self._begin_grasp_planning(st, "object found")
-            elif ts > a.search_timeout:
-                self._enter("ABORT", "object not found")
+                self._object_found(st, "object found")
+            elif ts > (a.side_search_timeout if self._can_plan() and not a.no_los else a.search_timeout):
+                if not self._search_next_side(st):
+                    self._end_episode("object not found" + (f" from the {', '.join(self.searched)} side(s)"
+                                                            if self.searched else ""), failed=True)
             return None, hold, q
 
         if self.state == "VGN_SCAN":
             q = list(SCAN_SEED_Q)
             if self.view_i < len(self.view_pans):
                 q[0] = self.view_pans[self.view_i]
-                if abs(st.q[0] - q[0]) < 0.03 and np.max(np.abs(self.u_prev)) < 0.03:
+                if (self._camera_ready(still_for=0.0 if abs(st.q[0] - q[0]) < 0.10 else 1.0)
+                        if self.vis_deg is not None else
+                        abs(st.q[0] - q[0]) < 0.03 and np.max(np.abs(self.u_prev)) < 0.03):
                     n = self._vgn_capture(st, "scan")
                     if n is None:  # real camera: waiting for a depth frame taken at this pose
                         self.view_wait_t0 = t if self.view_wait_t0 is None else self.view_wait_t0
@@ -1223,14 +1520,14 @@ class ActivePerceptionWBC:
                 if static and self._can_plan():  # hidden from this side: try another one
                     self._replan(st, why)
                 else:
-                    self._enter("ABORT", why)
+                    self._end_episode(why, failed=True)
                 return None, BaseReference(st.base.copy(), np.zeros(3)), ARM_HOME_Q
             obj, v_obj = self.tracker.predict(t), self.tracker.v
             if self.state != "GRASP":
                 t_exit = self.w.support_exit_time(obj, v_obj)
                 if t_exit < 1.5:
-                    self._enter("ABORT", f"predicted path leaves the table in {t_exit:.1f} s — "
-                                         "object cannot be intercepted on the table")
+                    self._end_episode(f"predicted path leaves the table in {t_exit:.1f} s — "
+                                      "object cannot be intercepted on the table", failed=True)
                     return None, BaseReference(st.base.copy(), np.zeros(3)), ARM_HOME_Q
 
             if self.state == "PRE_GRASP":
@@ -1255,7 +1552,7 @@ class ActivePerceptionWBC:
                     # e.g. oscillating at the edge of the workspace: another side instead
                     self._replan(st, f"pre-grasp not reached in {PREGRASP_TIMEOUT:.0f} s")
                 elif ts > 30.0:
-                    self._enter("ABORT", "pre-grasp not reached")
+                    self._end_episode("pre-grasp not reached", failed=True)
                 return ref, None, ARM_HOME_Q
 
             if self.state == "RETREAT":  # --goto_grasp_only: back up above the object, then done
@@ -1265,9 +1562,9 @@ class ActivePerceptionWBC:
                     e = np.array(self.at_grasp_err or [np.nan])
                     if self.result != "contact at the grasp pose":
                         self.result = GOTO_DONE
-                    self._enter("DONE", f"back at the pre-grasp height | during {a.hold_time:.1f} s at the grasp pose "
-                                        f"the EE was {np.nanmean(e) * 100:.1f} cm (mean), {np.nanmax(e) * 100:.1f} cm "
-                                        "(max) from the grasp point")
+                    self._end_episode(f"back at the pre-grasp height | during {a.hold_time:.1f} s at the grasp pose "
+                                      f"the EE was {np.nanmean(e) * 100:.1f} cm (mean), {np.nanmax(e) * 100:.1f} cm "
+                                      "(max) from the grasp point")
                 return ref, hold, ARM_HOME_Q
             off = [0.0, 0.0, a.grasp_dz]
             ref = self._mpc(off, self.grasp_R, a_max=0.3, v_max=EE_DESCEND_SPEED)
@@ -1289,10 +1586,13 @@ class ActivePerceptionWBC:
                                 + (" (limited by table clearance)" if stuck else ""))
             elif self.state == "AT_GRASP":
                 self.at_grasp_err.append(float(np.linalg.norm(self.ee - goal)))
-                if ts > 0.5 and self.at_grasp_err[-1] > AT_GRASP_PUSHED:   # contact (something unseen)
+                # contact: the EE cannot follow its own reference. A jump of the object estimate moves the
+                # goal, not the EE's lag behind the smooth MPC reference -> no false "contact"
+                lag = float(np.linalg.norm(self.ee - ref.p))
+                if ts > 0.5 and lag > AT_GRASP_PUSHED:   # contact (something unseen)
                     a.d_safe = self.d_safe
                     self.result = "contact at the grasp pose"
-                    self._enter("RETREAT", f"EE pushed {self.at_grasp_err[-1] * 100:.1f} cm off the grasp pose — "
+                    self._enter("RETREAT", f"EE held {lag * 100:.1f} cm off its reference — "
                                            "contact with something the robot does not know? -> backing up")
                 elif ts >= max(a.hold_time, 0.5):
                     a.d_safe = self.d_safe
@@ -1310,13 +1610,13 @@ class ActivePerceptionWBC:
                 gt = self.w.ground_truth()
                 if gt is not None and gt[2] <= 0.90:
                     self.result = "object not lifted"
-                    self._enter("DONE", f"object z = {gt[2]:.3f} m -> not lifted")
+                    self._end_episode(f"object z = {gt[2]:.3f} m -> not lifted")
                 elif a.hold_time > 0:
                     self._enter("HOLD", (f"object z = {gt[2]:.3f} m -> LIFTED; " if gt is not None else "")
                                 + f"holding it for {a.hold_time:.1f} s")
                 else:
                     self.result = "success" if gt is not None else "done"
-                    self._enter("DONE", "lift complete")
+                    self._end_episode("lift complete")
             return ref, hold, ARM_HOME_Q
 
         if self.state == "HOLD":  # keep the object up: a grasp that slips drops it here
@@ -1327,16 +1627,149 @@ class ActivePerceptionWBC:
             if ts >= a.hold_time:
                 if gt is None:
                     self.result = "done"
-                    self._enter("DONE", "hold complete")
+                    self._end_episode("hold complete")
                 else:
                     held = gt[2] > 0.90 and np.linalg.norm(gt - (self.ee - [0, 0, a.grasp_dz])) < HOLD_TOL
                     self.result = "success" if held else "dropped after the lift"
-                    self._enter("DONE", f"after {a.hold_time:.1f} s: object z = {gt[2]:.3f} m, "
-                                        f"max {self.hold_slip * 100:.1f} cm from the grasp point -> "
-                                        + ("HELD" if held else "DROPPED / SLIPPED"))
+                    self._end_episode(f"after {a.hold_time:.1f} s: object z = {gt[2]:.3f} m, "
+                                      f"max {self.hold_slip * 100:.1f} cm from the grasp point -> "
+                                      + ("HELD" if held else "DROPPED / SLIPPED"))
             return ref, hold, ARM_HOME_Q
 
+        if self.state == "RELEASE":  # --continuous with a gripper: hand the object over, then watch
+            ref = self.mpc.step(self.lift_goal, np.zeros(3), np.zeros(3), self.grasp_R, 0.4, 0.08, dt)
+            if ts >= a.handover_time and not self.released:
+                self.released = True
+                self.w.gripper(False)
+                print("  gripper opened")
+            if ts >= a.handover_time + RELEASE_OPEN_WAIT:
+                self._watch(st, "gripper open")
+            return ref, hold, ARM_HOME_Q
+
+        if self.state == "WATCH":  # --continuous: wait for the object to be put down somewhere new
+            if self.tracker.p is not None and t - self.last_seen > WATCH_RETRACK:
+                self.tracker = ObjectTracker()  # picked up / carried away: start a new track
+            if self.sim:
+                self._sim_relocate(ts)
+            q = list(SCAN_SEED_Q)
+            look = self.tracker.predict(t) if self.tracker.p is not None else self.watch_ref
+            if look is not None:
+                q[0] = self._pan_to(st, look)
+            if self.tracker.p is None:
+                if t - self.watch_lost_t > WATCH_SEARCH_AFTER:
+                    self.pan_cmd, self.pan_dir = st.q[0], -1.0
+                    self._enter("COARSE_DETECT", "object not in view -> sweeping shoulder_pan")
+                return None, hold, q
+            self.watch_lost_t = t
+            why = self._placed_anew(t)
+            if why and not self.vgn_pending:  # (a late inference of the last episode is dropped first)
+                self._new_episode(st, why)
+            return None, hold, q
+
         return None, BaseReference(st.base.copy(), np.zeros(3)), list(st.q)
+
+    # ── continuous operation (--continuous) ─────────────────────────────────
+    def _reset_episode(self):
+        """Per-episode state: everything a grasp attempt decides or learns about the object."""
+        self.grasp_R, self.result = R_TOPDOWN.copy(), "aborted"
+        self.transit_z = None  # z of the obstacle-clearing transit in PRE_GRASP (None: direct)
+        self.placed, self.bad_sides, self.base_path = False, set(), []
+        self.arrival_side = None  # table side the robot first arrived on (quadrant frame)
+        self.glimpse = None  # (position, t) of a detection made while the camera was swinging
+        self.view_pans, self.vgn_t0, self.vgn_t_first, self.vgn_t_start = [], None, None, None
+        self.vgn_result, self.vgn_ready_t, self.vgn_used = None, np.inf, False
+        self.vgn_views, self.vgn_last_view = {}, None
+        self.vgn_status, self.vgn_score = "not run", None
+        self.vgn_hover_t0, self.vgn_hover_gave_up = None, False
+        self.vgn_center, self.view_wait_t0 = None, None
+        self.explored, self.explore_why = [], None  # table sides where VGN found no grasp
+        self.hold_slip, self.at_grasp_err, self.released = 0.0, None, False
+        self.mpc = None
+
+    def _object_found(self, st, why):
+        """Object tracked after a search: plan the grasp — or, while watching, first make sure it has
+        been put down somewhere new (WATCH)."""
+        if self.watching:
+            self.watch_lost_t = self.t
+            self._enter("WATCH", f"{why} -> is it put down somewhere new?")
+        else:
+            self._begin_grasp_planning(st, why)
+
+    def _end_episode(self, msg, failed=False):
+        """An episode is over (self.result set; failed: it could not be completed). Without --continuous
+        (or after --max_episodes) the run ends: DONE / ABORT. Otherwise the object is handed over
+        (gripper) and the robot watches for its next placement."""
+        a = self.a
+        if not self.watching:
+            self.episodes.append((self.episode, self.t, self.result if not failed or self.result != "aborted"
+                                  else f"failed: {msg.split(' — ')[0]}"))
+        if not a.continuous or (a.max_episodes and self.episode >= a.max_episodes):
+            self._enter("ABORT" if failed else "DONE", msg)
+            return
+        a.d_safe = self.d_safe
+        if not self.watching and self.tracker.p is not None:
+            # the next placement must be elsewhere: where the object was seen with the camera still
+            still = [p for (_, p, s) in self.tracker.hist if s]
+            self.watch_ref = np.median(still, axis=0) if still else self.tracker.predict(self.t)
+        if not failed and not a.goto_grasp_only and self.mpc is not None:
+            self._enter("RELEASE", f"{msg} | take the object out of the gripper: it opens in "
+                                   f"{a.handover_time:.0f} s")
+        else:
+            self._watch(self.st, msg)
+
+    def _watch(self, st, msg):
+        self.watching, self.watch_lost_t, self.sim_relocated = True, self.t, False
+        self.base_hold, self.base_path, self.searched = st.base.copy(), [], []
+        self.mpc, self.transit_z = None, None
+        self._enter("WATCH", f"{msg} -> episode {self.episode} over; watching for the object to be put down "
+                    + (f"at least {self.a.watch_moved * 100:.0f} cm from {np.round(self.watch_ref[:2], 2)}"
+                       if self.watch_ref is not None else "on the table")
+                    + " (Ctrl+C ends)")
+
+    def _placed_anew(self, t):
+        """Reason string if the tracked object rests at a new place (still for WATCH_SETTLE, at least
+        --watch_moved from where the last episode left it), else None."""
+        if not self._tracked() or np.any(self.tracker.v):
+            return None
+        # only detections taken with the camera still: a moving camera biases them (TF lag)
+        recent = [p for (tp, p, still) in self.tracker.hist if t - tp <= WATCH_SETTLE and still]
+        if t - self.tracker.hist[0][0] < WATCH_SETTLE or len(recent) < 5:
+            return None
+        p = np.median(recent, axis=0)
+        if max(np.linalg.norm(q[:2] - p[:2]) for q in recent) > WATCH_STILL_TOL:
+            return None
+        if self.watch_ref is None:
+            return f"object at {np.round(p, 3)}"
+        moved = float(np.linalg.norm(p[:2] - self.watch_ref[:2]))
+        if moved < self.a.watch_moved:
+            return None
+        return f"object put down at {np.round(p, 3)}, {moved * 100:.0f} cm from where it was"
+
+    def _new_episode(self, st, why):
+        self.episode += 1
+        self.watching, self.watch_ref = False, None
+        self._reset_episode()
+        if self.hmap is not None:
+            self._setup_map()  # a fresh table map: hands and arms seen while the object was moved
+        self.side = self._side_of(st.base, *self.w.support_rect()) if self.w.support_rect() is not None else None
+        print(f"\n{'═' * 74}\n  Episode {self.episode}\n{'═' * 74}")
+        self._begin_grasp_planning(st, why)
+
+    def _sim_relocate(self, ts):
+        """Simulation: 'someone' puts the object down somewhere else on the table, SIM_RELOCATE_AFTER s
+        into WATCH — random, 0.1 m inside the table edges, at least 0.2 m from the last place."""
+        if self.sim_relocated or ts < SIM_RELOCATE_AFTER or self.w.support_rect() is None:
+            return
+        self.sim_relocated = True
+        lo, hi = self.w.support_rect()
+        rng = np.random.default_rng(self.a.sim_seed + self.episode)
+        old = self.watch_ref[:2] if self.watch_ref is not None else 0.5 * (lo + hi)
+        for _ in range(100):
+            xy = rng.uniform(lo + 0.10, hi - 0.10)
+            if np.linalg.norm(xy - old) > 0.20:
+                break
+        self.w.relocate(xy)
+        print(f"  [sim] object put down at ({xy[0]:.2f}, {xy[1]:.2f})")
 
     def _begin_grasp_planning(self, st, why):
         if self.w.vgn_checking():
@@ -1357,11 +1790,11 @@ class ActivePerceptionWBC:
             if plan is None:
                 if self.explored:
                     self.result = NO_GRASP
-                    self._enter("ABORT", f"{NO_GRASP.upper()} — VGN found no grasp from the "
-                                         f"{', '.join(self.explored)} side(s); no other side is reachable")
+                    self._end_episode(f"{NO_GRASP.upper()} — VGN found no grasp from the "
+                                      f"{', '.join(self.explored)} side(s); no other side is reachable", failed=True)
                 else:
-                    self._enter("ABORT", f"object not reachable from any side of the table with the base "
-                                         f"{self.a.d_safe_base * 100:.0f} cm away")
+                    self._end_episode(f"object not reachable from any side of the table with the base "
+                                      f"{self.a.d_safe_base * 100:.0f} cm away", failed=True)
                 return
             if plan["path"]:
                 self.side, self.base_path = plan["side"], plan["path"]
@@ -1419,6 +1852,8 @@ class ActivePerceptionWBC:
     def _vgn_capture(self, st, where):
         """Take a VGN view; None while a real camera's frame is still on its way."""
         n = self.w.vgn_view(self.tracker.predict(self.t), self._vgn_shift())
+        if n is not None and self.hmap is not None and getattr(self.w, "last_view", None) is not None:
+            self._integrate_map(*self.w.last_view)
         if n is None:
             return None
         if self.side:
@@ -1445,7 +1880,8 @@ class ActivePerceptionWBC:
         q = list(SCAN_SEED_Q)
         q[0] = self._pan_to(st, obj)
         n = self.w.vgn_n_views() if self.vgn_t0 is not None else 0
-        ready = np.max(np.abs(np.asarray(q) - st.q)) < VGN_ARM_READY
+        ready = (self._camera_ready() if self.vis_deg is not None  # driving: the arm keeps adjusting
+                 else np.max(np.abs(np.asarray(q) - st.q)) < VGN_ARM_READY)
         n_min, n_max = self._drive_views()
         if ready and n < n_max:
             last = self.vgn_last_view
@@ -1479,6 +1915,8 @@ class ActivePerceptionWBC:
             if r is not None:
                 best, dur = r
                 self.vgn_pending = False
+                if self.watching:  # a late result of the episode that just ended
+                    return
                 self.vgn_result, self.vgn_ready_t = (best,), self.vgn_t_start + dur
         if self.vgn_result is not None and not self.vgn_used and self.t >= self.vgn_ready_t:
             self.vgn_used = True
@@ -1562,7 +2000,7 @@ class ActivePerceptionWBC:
             reason = ("no table model (--table): cannot plan other sides" if not self._can_plan()
                       else f"explored {len(self.explored)} side(s)")
             self.result = NO_GRASP
-            self._enter("ABORT", f"{NO_GRASP.upper()} — {why}; {reason}")
+            self._end_episode(f"{NO_GRASP.upper()} — {why}; {reason}", failed=True)
             return
         print(f"  {why} -> exploring another side (not tried yet: {', '.join(left)})")
         self._begin_grasp_planning(st, why)
@@ -1646,9 +2084,11 @@ class ActivePerceptionWBC:
         """Smooth orbit start -> goal around the table (TableOrbit), the shorter way round:
         (OrbitPath, length [m])."""
         _, o = self._ring(lo, hi)
-        path = TableOrbit(lo, hi, o).path(np.asarray(start, float), np.asarray(goal, float),
-                                          min(REPOSITION_SPEED, self.a.max_base_v))
+        path = TableOrbit(lo, hi, o).path(np.asarray(start, float), np.asarray(goal, float), self._orbit_v())
         return path, path.length
+
+    def _orbit_v(self):
+        return min(self.a.orbit_speed, self.a.max_base_v)
 
     def _plan_approach(self, st, obj):
         """Cheapest base pose, among staying and the four table sides, from which the whole grasp
@@ -1673,7 +2113,7 @@ class ActivePerceptionWBC:
             # where the object will be when the grasp from this side can start
             eta = GRASP_ETA
             if name != here:
-                eta += self._ring_path(st.base, np.array([*obj[:2], yaw]), lo, hi)[1] / REPOSITION_SPEED
+                eta += self._ring_path(st.base, np.array([*obj[:2], yaw]), lo, hi)[1] / self._orbit_v()
             o = self.tracker.predict(self.t + eta)
             xy = np.clip(o[:2], lo, hi)
             xy = np.where(n != 0, np.where(n > 0, hi, lo) + n * standoff, xy)
@@ -1683,11 +2123,25 @@ class ActivePerceptionWBC:
                 goal = np.array([xy[0], xy[1], yaw])
                 path, length = self._ring_path(st.base, goal, lo, hi)
             cands.append((length, name, goal, path, o))
+        los, cams = {}, []
+        if self.hmap is not None and self.hmap.occupied.any():
+            for _, name, pose, _, o in cands:
+                los[name], c = self._los_from(pose, o)
+                cams.append((f"{name} {100 * los[name]:.0f}%", c))
+            print(f"  line of sight to the object (table map: {self.hmap.summary()}): "
+                  + ", ".join(f"{n} {100 * v:.0f}%" for n, v in los.items()))
+            if self.w.save_dir is not None:
+                import cv2
+                self.n_maps = getattr(self, "n_maps", 0) + 1
+                cv2.imwrite(str(self.w.save_dir / f"table_map_{self.n_maps:02d}.png"),
+                            self.hmap.image(target=obj, cams=cams))
         report, chosen = [], None
         R0 = self.grasp_R.copy()
         # the side of the object's table region first (near half: stay); the others (here first, then
         # by path length) only if it is not reachable; sides where VGN found no grasp are not candidates
-        for cost, name, pose, path, o in sorted(cands, key=lambda c: (c[1] != preferred, c[0])):
+        # sides the object is hidden from (line of sight < LOS_OK) last
+        for cost, name, pose, path, o in sorted(cands, key=lambda c: (los.get(c[1], 1.0) < LOS_OK,
+                                                                      c[1] != preferred, c[0])):
             if np.any(o[:2] < lo + 0.03) or np.any(o[:2] > hi - 0.03):
                 report.append(f"{name}: object off the table by then")
                 continue
@@ -1724,29 +2178,23 @@ class ActivePerceptionWBC:
             return 1
         self.ctrl = WholeBodyController(self.kin, a, q_nom=DRIVE_POSE, yaw_nom=st.base[2])
         self.u_prev = np.zeros(NU)
+        self.state = "DRIVE"
+        self._setup_camera(st)
+        self._setup_map()
         self.state, self.t, self.t0 = "DRIVE", 0.0, self.b.now()
         self.t_state, self.n_tick = 0.0, 0
         self.base_hold, self.drive_start = st.base.copy(), st.base.copy()
-        self.tracker, self.last_seen, self.n_seen = ObjectTracker(), -np.inf, {}
-        self.grasp_R, self.result = R_TOPDOWN.copy(), "aborted"
+        self.tracker, self.last_seen, self.n_seen, self.n_bad_z = ObjectTracker(), -np.inf, {}, 0
         self.min_obst_clr = np.inf
         self.min_base_clr = np.inf  # base footprint <-> environment, must stay >= d_safe_base
-        self.transit_z = None  # z of the obstacle-clearing transit in PRE_GRASP (None: direct)
-        self.placed, self.side, self.bad_sides, self.base_path = False, None, set(), []
-        self.arrival_side = None  # table side the robot first arrived on (quadrant frame)
-        self.glimpse = None  # (position, t) of a detection made while the camera was swinging
-        self.view_pans, self.vgn_t0, self.vgn_t_first, self.vgn_t_start = [], None, None, None
-        self.vgn_pending, self.vgn_result, self.vgn_ready_t, self.vgn_used = False, None, np.inf, False
-        self.vgn_views, self.vgn_last_view, self.vgn_wait = {}, None, 0.0
-        self.vgn_status, self.vgn_score = "not run", None
-        self.vgn_hover_t0, self.vgn_hover_gave_up = None, False
+        self.side, self.vgn_pending, self.vgn_wait = None, False, 0.0
         self.vgn_check_note = False  # "waiting for the environment check" printed
-        self.vgn_center, self.view_wait_t0 = None, None
-        self.explored, self.explore_why = [], None  # table sides where VGN found no grasp
-        self.hold_slip = 0.0
+        self._reset_episode()
+        # --continuous: episode number, [(episode, t, result)], watching for the next placement
+        self.episode, self.episodes, self.watching, self.watch_ref, self.st = 1, [], False, None, st
         self.kin.set_state(st)
         p0, R0 = self.kin.ee_pose()
-        self.mpc, self.ee = None, p0
+        self.ee = p0
         rows, next_print = [], 0.0
         safety = make_safety(self.b, a)
         stop_t0 = None  # start of the current safety stop
@@ -1792,14 +2240,36 @@ class ActivePerceptionWBC:
                         print(f"  obstacle (top z={top:.2f} m) between gripper and object -> "
                               f"transit at z={self.transit_z:.2f} m")
 
+                self.st = st
                 ee_ref, base_ref, q_nom = self.update(st)
-                if ee_ref is None and self.state in ("PRE_GRASP", "DESCEND", "GRASP", "AT_GRASP", "RETREAT", "LIFT"):
+                if ee_ref is None and self.state in ("PRE_GRASP", "DESCEND", "GRASP", "AT_GRASP", "RETREAT", "LIFT",
+                                                     "RELEASE"):
                     continue  # state just changed; next tick produces the reference
                 self.ctrl.q_nom = np.asarray(q_nom, float)
                 self.ctrl.yaw_nom = self.base_hold[2]
                 tic = time.perf_counter()
-                u, info = self.ctrl.step(st, ee_ref, self.u_prev, self.dt, base_ref)
+                if self.hmap is not None:
+                    self._update_map()
+                look = self._look_target()
+                use = self.vis_on and look is not None
+                u, info = self.ctrl.step(st, ee_ref, self.u_prev, self.dt, base_ref,
+                                         look=look if use else None,
+                                         los_obstacles=self.los_pts if use and self.hmap is not None else None,
+                                         look_radius=self.w.target.radius)
                 solve_ms = (time.perf_counter() - tic) * 1e3
+                self.vis_deg = info.get("vis_deg") if look is not None and self.vis_on else None
+                ang = self.vis_deg
+                if look is not None and not self.vis_on:  # --no_visibility: measured only (kin is at st)
+                    c_cam, z_cam, _, _ = self.kin.camera(st.base[2])
+                    los = look - c_cam
+                    ang = float(np.degrees(np.arccos(np.clip(z_cam @ los / np.linalg.norm(los), -1.0, 1.0))))
+                if np.max(np.abs(u[3:])) < 0.03:
+                    self.still_since = self.t if self.still_since is None else self.still_since
+                else:
+                    self.still_since = None
+                if ang is not None:
+                    self.vis_ticks += 1
+                    self.vis_good += ang < VIS_FOV_DEG
                 if not np.all(np.isfinite(u)):
                     self._enter("ABORT", "non-finite command")
                     break
@@ -1832,7 +2302,9 @@ class ActivePerceptionWBC:
                     clr = f" clr={info['d_min'] * 100:.1f}cm" if np.isfinite(info["d_min"]) else ""
                     print(f"  t={self.t:5.1f}s [{self.state:13s}] base=({st.base[0]:+.2f},{st.base[1]:+.2f},"
                           f"{np.degrees(st.base[2]):+4.0f}°) u_b=({u[0]:+.2f},{u[1]:+.2f},{u[2]:+.2f}) "
-                          f"|dq|={np.abs(u[3:]).max():.2f}{clr}{est}")
+                          f"|dq|={np.abs(u[3:]).max():.2f}{clr}{est}"
+                          + (f" vis={self.vis_deg:.0f}°" if self.vis_deg is not None else "")
+                          + (f" los={info['n_los']}" if info.get("n_los") else ""))
                 self.u_prev = u
                 if self.state in ("VGN_SCAN", "VGN_WAIT"):
                     self.vgn_wait += self.dt  # robot held at the table for VGN
@@ -1850,11 +2322,22 @@ class ActivePerceptionWBC:
         if self.min_base_clr < a.d_safe_base - 1e-3 and self.result in ("success", "done", GOTO_DONE):
             self.result = "base safety distance violated"
         print(f"\n{'─' * 74}\n  Result: {self.result}  (final state {self.state}, t={self.t:.1f} s)")
+        if a.continuous:
+            print(f"  Episodes ({len(self.episodes)} finished):")
+            for n, te, r in self.episodes:
+                print(f"    {n:2d}  t={te:6.1f} s  {r}")
         if self.explored:
             print(f"  Explored: VGN found no grasp from the {', '.join(self.explored)} side(s)"
                   + (f", grasp pose reached from the {self.side} side" if self.result in ("success", "done", GOTO_DONE)
                      else ""))
         print(f"  Detections used: {self.n_seen}   rejected by the gate: {self.tracker.rejected}")
+        if getattr(self, "hmap", None) is not None:
+            print(f"  Table map: {self.hmap.summary()}" + (f"; searched from {', '.join(self.searched)}"
+                                                         if self.searched else ""))
+        if getattr(self, "vis_ticks", 0):
+            print(f"  Camera on the object (axis within {VIS_FOV_DEG:.0f}°): {100.0 * self.vis_good / self.vis_ticks:.0f}% "
+                  f"of {self.vis_ticks * self.dt:.1f} s while the EE was free — visibility task "
+                  f"{'on' if self.vis_on else 'off'}")
         if self.w.vgn_available() or self.vgn_status != "not run":
             views = ", ".join(f"{n} {k}" for k, n in self.vgn_views.items()) or "none"
             timing = ""
@@ -1875,6 +2358,8 @@ class ActivePerceptionWBC:
         summarize(rows, a)
         if safety is not None:
             print(safety.summary())
+        if a.continuous:
+            return 0 if self.episodes and all(r in ("success", "done", GOTO_DONE) for _, _, r in self.episodes) else 1
         return 0 if self.result in ("success", "done", GOTO_DONE) else 1
 
 
@@ -1921,7 +2406,7 @@ def main(argv=None):
                         "x 1.6..2.4, y -0.35..0.35, the robot arrives from -x")
     g.add_argument("--target", default="red",
                    help="target profile: name in steve_wbc/config/targets or a path (target_calibrator)")
-    g.add_argument("--scene", choices=["single", "clutter", "far"], default="single",
+    g.add_argument("--scene", choices=["single", "clutter", "far", "occluded"], default="single",
                    help="sim: one object | a red cube among static obstacles (only the cube is picked) | "
                         "a cube out of reach from the front (drive around the table)")
     g.add_argument("--no_reposition", action="store_true",
@@ -1936,6 +2421,16 @@ def main(argv=None):
     g.add_argument("--vgn_views", type=int, default=None,
                    help="views per grasp scan (default 4); drive mode: inference starts once this many are "
                         "taken while driving (default 6) — 1: as soon as the object is in view and in range")
+    g.add_argument("--no_los", action="store_true",
+                   help="no occlusion-aware line of sight (table map from depth, side choice, QP term, "
+                        "searching the other sides)")
+    g.add_argument("--side_search_timeout", type=float, default=12.0,
+                   help="with a table model: object not found from a side within this [s] -> search from the "
+                        "next side (no table model: --search_timeout, then abort)")
+    g.add_argument("--no_visibility", action="store_true",
+                   help="no visibility task: the camera is aimed only through the posture's shoulder pan")
+    g.add_argument("--look_camera_frame", default="gripper_camera_color_optical_frame",
+                   help="robot: optical frame of the camera the visibility task aims (TF)")
     g.add_argument("--vgn_drive_range", type=float, default=VGN_DRIVE_RANGE,
                    help="drive mode: base-object distance below which views are taken while driving [m] "
                         "(real D415: ~1.2, its depth gets coarse farther away)")
@@ -1971,6 +2466,9 @@ def main(argv=None):
     g.add_argument("--vgn_max_level", type=float, default=8.0,
                    help="robot: largest table-plane tilt correction applied to a VGN view [deg]")
     g.add_argument("--render_every", type=int, default=3, help="perception every N control ticks")
+    g.add_argument("--detect_z_tol", type=float, default=0.05,
+                   help="with a table (sim, or --table): ignore detections whose centre is further than this from resting on "
+                        "the table top (top_z + radius) [m] — close-range / mis-registered depth")
     g.add_argument("--min_detect_range", type=float, default=0.20,
                    help="ignore detections closer than this to the camera [m] (occlusion)")
     g.add_argument("--drive_speed", type=float, default=0.25, help="[m/s]")
@@ -1988,6 +2486,19 @@ def main(argv=None):
     g.add_argument("--hold_time", type=float, default=3.0,
                    help="after the lift, keep holding the object this long; success only if it stays "
                         "in the gripper [s] (0: success at the end of the lift)")
+    g.add_argument("--continuous", action="store_true",
+                   help="never stop after an episode: hand the object over (gripper: opens after "
+                        "--handover_time), then watch the table and go for the object again once it has been "
+                        "put down somewhere new (>= --watch_moved away); searches around the table if it is "
+                        "out of view. Ctrl+C ends. Sim: the object is moved automatically")
+    g.add_argument("--max_episodes", type=int, default=0, help="--continuous: stop after this many (0: never)")
+    g.add_argument("--watch_moved", type=float, default=0.10,
+                   help="--continuous: a new placement is at least this far from the last one [m]")
+    g.add_argument("--handover_time", type=float, default=5.0,
+                   help="--continuous with a gripper: after the hold, open the gripper after this long [s]")
+    g.add_argument("--sim_seed", type=int, default=0, help="--continuous, sim: seed of the object placements")
+    g.add_argument("--orbit_speed", type=float, default=REPOSITION_SPEED,
+                   help="base speed around the table [m/s] (capped by --max_base_v)")
     g.add_argument("--d_safe_grasp", type=float, default=0.005, help="collision margin for the final descent [m]")
     g.add_argument("--search_timeout", type=float, default=30.0, help="[s]")
     g.add_argument("--lost_timeout", type=float, default=3.0, help="abort if a moving object is unseen for [s]")
@@ -2015,7 +2526,7 @@ def main(argv=None):
     if a.object_type is None:
         a.object_type = "box" if static_cube else "sphere"
     if a.object_speed is None:
-        a.object_speed = 0.0 if static_cube else 0.02  # a rolling cube would plough into the obstacles
+        a.object_speed = 0.0 if static_cube or a.scene == "occluded" else 0.02  # a rolling cube would plough into the obstacles
 
     if a.camera_tilt:  # drive + scan poses look forward-down (wrist 1 negative = camera forward)
         for pose in (DRIVE_POSE, SCAN_SEED_Q):

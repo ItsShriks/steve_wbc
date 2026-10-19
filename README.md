@@ -107,11 +107,38 @@ the real robot.
   start it, default 6 in `drive`, 4 in `scan`; `--vgn_drive_range`: base–object distance for drive views,
   default 2.3 m, ~1.2 m for the D415's depth). No drive view (arm not yet in scan pose): a stopped
   1-view scan instead.
+* **Visibility task** (default on; `--no_visibility` off): while the EE is free (`DRIVE`, `SETTLE_ARM`,
+  `COARSE_DETECT`, `REPOSITION`, `VGN_SCAN`, `VGN_WAIT`) a QP task keeps the camera's optical axis z on
+  the tracked object p: with d = (p - c)/|p - c| the line of sight from the optical centre c,
+  e = z x d (|e| = sin of the angle) and e-dot = [d]x [z]x J_w u - [z]x (I - d d^T) J_c u / |p - c| for a
+  static object; the task asks e-dot = -k_vis e (`--k_vis` 1.5 1/s, `--w_vis` 50). It shares the posture's
+  hierarchy level (own level: `--priorities ee,base,vis,posture`, +1 QP per tick), so it only uses the
+  freedom left by the base task. Camera: MuJoCo `wrist_cam`; robot: the optical frame from TF
+  (`--look_camera_frame`, the calibrated mount), fixed on the model's gripper body at the start. Settling
+  and scan / drive views then wait for "camera on the object" (< 4°) instead of the exact posture; the
+  summary prints the share of time the axis was within 20° of the object (measured with
+  `--no_visibility` too; sim, static ball, 1-view VGN: 29% without the task, 100% with it, same result
+  and time). Repositioning paths use a
+  trapezoidal speed profile (0.25 m/s² ramps; ~0.95 of `--max_base_v` on average instead of 0.53).
 * **Go to the grasp pose only** (`--goto_grasp_only`, launch `goto_grasp_only:=true`; no gripper on
   the arm): after the descent the EE stays at the grasp pose with the object (static or moving) for
   `--hold_time`, never closes a gripper or lifts, then backs up to the pre-grasp height
   (`AT_GRASP → RETREAT → DONE`, result `reached grasp pose`, with the mean / max EE distance from the
   grasp point). `--grasp_dz 0.05` hovers 5 cm higher.
+* **Continuous** (`--continuous`, launch `continuous:=true`): the run does not end after an episode.
+  With a gripper the object is held, then the gripper opens after `--handover_time` (5 s) so it can
+  be taken out (`RELEASE`); then (`WATCH`) the camera stays on the object, and once it is put down
+  somewhere new — still for 1.5 s, ≥ `--watch_moved` (10 cm) from the last place — the next episode
+  starts from where the robot stands (side planning, drive around the table, scan, grasp). Out of
+  view: arm sweep after 4 s, then the other table sides, round and round. A failed episode (not
+  reachable, no grasp, ...) also waits for the object to be moved. Ctrl+C ends; `--max_episodes N`
+  stops after N. The summary lists every episode. In MuJoCo the object is moved automatically 3 s
+  into `WATCH` (`--sim_seed`):
+  `python3 active_perception_wbc.py --headless --no_vgn --object_speed 0 --goto_grasp_only --continuous --max_episodes 3`
+* **Orbit speed** (`--orbit_speed`, default 0.25 m/s, capped by `--max_base_v`): the drive around the
+  table is a rounded ring (straight sides + quarter circles, constant distance, base facing the
+  table). Sim, `scene far` (3.5 m round): 0.10 → 36 s, 0.20 → 19 s, 0.30 → 14 s, 0.40 → 11 s, min
+  base clearance 16.2–16.8 cm at every speed (≥ 15 cm `--d_safe_base`, a hard QP constraint).
 * **Camera tilt** (`--camera_tilt DEG`): a camera looking along the flange axis sees only the
   floor / table straight below in the drive and scan poses (the MJCF wrist camera is mounted tilted);
   the tilt turns wrist 1 so it looks forward-down. With the gripper camera ~25° covers the table from
@@ -163,7 +190,7 @@ FASTRTPS_DEFAULT_PROFILES_FILE=~/.ros/fastdds_steve.xml` — the PC profile must
 | Camera | `ros2 launch steve_wbc gripper_camera.launch.py` | `/gripper_camera/{color,aligned_depth_to_color}/...` (848x480 @ 30, D415 min. range ~0.31 m), + mount TF once calibrated |
 | Ball profile (once) | `ros2 run steve_wbc target_calibrator --name my_ball --size 0.065 --topic /gripper_camera/color/image_raw` | `config/targets/my_ball.yaml` |
 | Camera mount (once per mounting) | `ros2 run steve_wbc gripper_camera_calibrator --target my_ball`; ball on the table, base still, 8 arm poses (`manipulator --direct joints ...`), Enter at each, `s` | `config/gripper_camera.yaml`: `ur5etool0` → `gripper_camera_color_optical_frame` |
-| Table (after every bringup restart: `odom` resets) | robot 0.3–1.5 m in front of the table: `ros2 run steve_wbc table_probe --name lab_table --lidar_only --top_z 0.827` | `config/tables/lab_table.yaml` (odom) |
+| Table (after every bringup restart: `odom` resets) | robot 0.3–1.5 m in front of the table: `ros2 run steve_wbc table_probe --name lab_table --lidar_only --top_z 0.827` | `config/tables/lab_table.yaml` (odom); the saved 5-leg shape is the template, only the pose is re-measured: any 3 visible legs suffice (a leg hidden behind another one is fine); `--no_template` measures the shape again (all 4 corners in view) |
 | Detector check | `ros2 run steve_wbc red_ball_detector --ros-args -p target:=my_ball -p topic_style:=realsense -p "cameras:=[gripper_camera]" -p "head_topic:=''"` | `/steve_perception/target_point` (odom) |
 | Dry run (robot does not move) | `ros2 launch steve_wbc active_perception_wbc.launch.py use_sim_time:=false launch_bringup:=false dry_run:=true table:=lab_table target:=my_ball detector_cameras:=gripper_camera vgn:=false goto_grasp_only:=true extra_args:="--camera_tilt 25"` | `... → AT_GRASP → RETREAT → DONE`, `reached grasp pose` |
 | Real run (robot ~1 m back, arm `home`) | the same without `dry_run:=true`, `extra_args:="--camera_tilt 25 --max_base_v 0.10 --max_arm_vel 0.3 --grasp_dz 0.05 --state_timeout 0.5"` (`--state_timeout 0.5`: Wi-Fi) | drives up, finds the ball, hovers 5 cm above the grasp pose, backs up |

@@ -261,6 +261,23 @@ class WholeBodyKinematics:
         mujoco.mj_jac(self.model, self.data, self._jp, None, point, body)
         return self.to_decision(self._jp, yaw)
 
+    cam = None  # (body id, optical centre, optical axis — both in the body frame) for the visibility task
+
+    def set_camera(self, body, p_local, axis_local):
+        """Camera of the visibility task: optical centre and optical axis (+z of an optical frame)
+        given in the frame of `body` (id), to which the camera is rigidly mounted."""
+        a = np.asarray(axis_local, float)
+        self.cam = (int(body), np.asarray(p_local, float).copy(), a / np.linalg.norm(a))
+
+    def camera(self, yaw):
+        """(optical centre c, optical axis z — world, 3x9 Jacobians of c and of the camera's angular
+        velocity) of the camera set with set_camera (after set_state)."""
+        b, pl, al = self.cam
+        R = self.data.xmat[b].reshape(3, 3)
+        c = self.data.xpos[b] + R @ pl
+        mujoco.mj_jac(self.model, self.data, self._jp, self._jr, c, b)
+        return c, R @ al, self.to_decision(self._jp, yaw), self.to_decision(self._jr, yaw)
+
 
 # ══════════════════════════════════════════════════════════════════════════════
 # Collision avoidance — velocity-damper inequality constraints
@@ -779,7 +796,7 @@ def goto_from_file(path, p0, R0, args):
     return GotoReference(p0, R0, wps, v_max=args.goto_speed, hold=args.goto_hold, names=names)
 
 
-TASK_NAMES = ("ee", "pos", "ori", "base", "posture")
+TASK_NAMES = ("ee", "pos", "ori", "base", "vis", "posture")
 
 
 def parse_priorities(spec):
@@ -798,6 +815,11 @@ def parse_priorities(spec):
         raise SystemExit("[ERROR] --priorities: the EE position ('ee' or 'pos') must be a task")
     if "posture" not in names:
         levels.append(["posture"])   # without it the redundancy would be unresolved
+    if "vis" not in names:
+        # visibility (only present when a look target is given) shares the posture's level, weighted
+        # far above it (--w_vis): same pointing as a level of its own (0.06 vs 0.04 deg after 4 s on
+        # the model) without one more QP per tick (+0.6 instead of +1.6 ms); own level: 'ee,base,vis,posture'
+        next(lvl for lvl in levels if "posture" in lvl).insert(0, "vis")
     return levels
 
 
@@ -849,10 +871,16 @@ class WholeBodyController:
         lb[bad], ub[bad] = mid[bad] - 1e-9, mid[bad] + 1e-9
         return lb, ub
 
-    def step(self, st: RobotState, ref, u_prev, dt, base_ref=None):
+    def step(self, st: RobotState, ref, u_prev, dt, base_ref=None, look=None, los_obstacles=None,
+             look_radius=0.0):
         """
         ref      : Reference for the EE task, or None (EE free, e.g. posture moves)
         base_ref : BaseReference for the soft base-pose task, or None
+        look     : world point the camera (kin.set_camera) should keep on its optical axis, or None
+                   (visibility task, between base and posture: only the arm's spare freedom)
+        los_obstacles : Nx3 world points (e.g. on objects standing on the table) the sight line
+                   camera -> look must keep --d_los away from (line-of-sight task, with `look`);
+                   look_radius: the target's radius (the sight line ends at its surface)
         """
         self.kin.set_state(st)
         p, R = self.kin.ee_pose()
@@ -891,6 +919,59 @@ class WholeBodyController:
             rows_b.append(w * u_b)
             T["base"] = (w * S, w * u_b)
 
+        # ── Visibility: optical axis z of the camera onto the (static) point `look` ──
+        # e = z x d, d = unit line of sight camera -> point, |e| = sin(angle). With omega / c-dot the
+        # camera's angular / centre velocity: z-dot = omega x z, d-dot = -(I - d d^T) c-dot / r, so
+        # e-dot = [d]x [z]x J_w u - [z]x (I - d d^T) J_c u / r; the task asks e-dot = -k_vis e.
+        vis_deg = None
+        if look is not None and self.kin.cam is not None:
+            c_cam, z, J_c, J_w = self.kin.camera(st.base[2])
+            los = np.asarray(look, float) - c_cam
+            r = float(np.linalg.norm(los))
+            if r > 0.05:
+                d = los / r
+                vis_deg = float(np.degrees(np.arccos(np.clip(z @ d, -1.0, 1.0))))
+                e = np.cross(z, d)
+                if z @ d < 0.0:  # point behind the camera: full effort in the turning direction
+                    n = np.linalg.norm(e)
+                    e = e / n if n > 1e-6 else np.cross(z, np.eye(3)[int(np.argmin(np.abs(z)))])
+                sk = lambda v: np.array([[0, -v[2], v[1]], [v[2], 0, -v[0]], [-v[1], v[0], 0]])
+                J_e = sk(d) @ sk(z) @ J_w - sk(z) @ (np.eye(3) - np.outer(d, d)) @ J_c / r
+                w = np.sqrt(self.a.w_vis)
+                A_v, b_v = [w * J_e], [w * (-self.a.k_vis * e)]
+                # ── Line of sight: obstacle points P closer than d_los to the sight segment
+                # S(t) = (1 - t) c + t q, q = p - r_e d the target's surface point facing the camera
+                # (r_e = radius + 5 mm, rho = |p - c|, so dq/dc = (r_e / rho)(I - d d^T)): with the
+                # target static and t* stationary (envelope theorem), d = |P - S(t*)| changes as
+                # d-dot = -n^T [(1 - t*) I + t* (r_e / rho)(I - d d^T)] J_c u  (n: unit S* -> P);
+                # asked d-dot = k_los (d_los - d) > 0 — the camera moves (up / sideways) until the
+                # line clears. Soft (rows only while violated): a line that cannot be cleared from
+                # here never stops the robot.
+                n_los = 0
+                if los_obstacles is not None and len(los_obstacles):
+                    P = np.asarray(los_obstacles, float)
+                    r_e = look_radius + 0.005
+                    q = np.asarray(look, float) - d * r_e
+                    L = q - c_cam
+                    tt = np.clip(((P - c_cam) @ L) / max(L @ L, 1e-9), 0.0, 1.0)
+                    D = P - (c_cam + tt[:, None] * L)
+                    dist = np.linalg.norm(D, axis=1)
+                    idx = np.argsort(dist)[:8]
+                    idx = idx[dist[idx] < self.a.d_los]
+                    if len(idx):
+                        n = D[idx] / np.maximum(dist[idx], 1e-6)[:, None]
+                        Pd = np.eye(3) - np.outer(d, d)
+                        J_d = -((1.0 - tt[idx])[:, None] * (n @ J_c)
+                                + (tt[idx] * r_e / r)[:, None] * (n @ Pd @ J_c))
+                        wl = np.sqrt(self.a.w_los)
+                        A_v.append(wl * J_d)
+                        b_v.append(wl * self.a.k_los * (self.a.d_los - dist[idx]))
+                        n_los = len(idx)
+                A_v, b_v = np.vstack(A_v), np.concatenate(b_v)
+                rows_A.append(A_v)
+                rows_b.append(b_v)
+                T["vis"] = (A_v, b_v)
+
         # ── Posture, projected into the null space of the EE task ───────────
         u_post = np.zeros(NU)
         if base_ref is None:  # base heading is otherwise owned by the base task
@@ -927,7 +1008,8 @@ class WholeBodyController:
                 self.qp_failures += 1
                 u = np.zeros(NU)
 
-        return u, dict(p=p, R=R, e_p=e_p, e_o=e_o, d_min=d_min, closest=closest, n_coll=len(c))
+        return u, dict(p=p, R=R, e_p=e_p, e_o=e_o, d_min=d_min, closest=closest, n_coll=len(c),
+                       vis_deg=vis_deg, n_los=n_los if vis_deg is not None else 0)
 
     def _solve_hierarchy(self, tasks, lb, ub, C, c):
         """Strict task hierarchy (lexicographic least squares): level k minimises its own
@@ -1906,12 +1988,20 @@ def build_arg_parser(description="Steve figure-8 unified velocity-level WBC (MuJ
     g.add_argument("--priorities", default="ee,base,posture",
                    help="strict hierarchy: task order, highest first; ',' separates levels, '+' puts "
                         "tasks on the same level (traded off by their weights). Tasks: ee (= pos+ori), "
-                        "pos, ori, base (only when a base path is set), posture. Examples: "
+                        "pos, ori, base (only when a base path is set), vis (only with a look target), posture. Examples: "
                         "'pos,ori,posture'  'base,ee,posture'  'pos,ori+posture'")
     g.add_argument("--hqp_tol", type=float, default=1e-3,
                    help="strict hierarchy: slack with which a lower level must keep a higher "
                         "level's (weighted) task value")
     g.add_argument("--w_base_task", type=float, default=50.0, help="weight of soft base-pose task")
+    g.add_argument("--w_vis", type=float, default=50.0,
+                   help="weight of the visibility task (camera axis onto the target; strict hierarchy: on "
+                        "the posture's level unless --priorities places it, e.g. 'ee,base,vis,posture')")
+    g.add_argument("--k_vis", type=float, default=1.5, help="visibility task gain [1/s]")
+    g.add_argument("--d_los", type=float, default=0.04,
+                   help="line of sight: clearance between the sight line camera -> target and obstacles [m]")
+    g.add_argument("--w_los", type=float, default=30.0, help="line-of-sight task weight")
+    g.add_argument("--k_los", type=float, default=2.0, help="line-of-sight task gain [1/s]")
     g.add_argument("--k_base", type=float, default=2.0, help="base-pose task gain [1/s]")
     g.add_argument("--lock_yaw", action="store_true", help="forbid base rotation")
 

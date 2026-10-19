@@ -154,6 +154,8 @@ def launch_setup(context: LaunchContext):
         args += ["--table", cfg("table")]
     if cfg("goto_grasp_only").lower() == "true":
         args.append("--goto_grasp_only")
+    if cfg("continuous").lower() == "true":
+        args.append("--continuous")
     args += ["--target", cfg("target")]
     detector = {"true": "hsv"}.get(cfg("detector").lower(), cfg("detector").lower())
     if detector not in ("hsv", "gsam", "false"):
@@ -279,6 +281,9 @@ def generate_launch_description():
                               description="velocity | trajectory (default: velocity on the robot, trajectory in Gazebo)"),
         DeclareLaunchArgument("goto_grasp_only", default_value="false",
                               description="go to the grasp pose and stay there (--hold_time), no gripper / lift"),
+        DeclareLaunchArgument("continuous", default_value="false",
+                              description="after each episode watch for the object to be put somewhere else and "
+                                          "go for it again (gripper: opens after --handover_time); Ctrl+C ends"),
         DeclareLaunchArgument("detector", default_value="hsv",
                               description="Gazebo / robot target detector: hsv (colour threshold, red_ball_detector; "
                                           "'true' = hsv) | gsam (Grounded SAM with gsam_prompt) | false (none)"),

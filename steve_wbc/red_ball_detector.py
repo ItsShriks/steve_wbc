@@ -115,6 +115,10 @@ class RedBallDetector(Node):
         # while grasping) the depth is invalid and the position 15-20 cm off (2026-10-15 runs)
         self.size_tol = p("size_tolerance", 0.4).value
         self.max_range = p("max_range", 4.0).value
+        # camera pose at the image's time; the latest TF instead only if it is this close to it: with
+        # the arm moving the latest pose is off by several cm (2026-10-19: 7 cm, same pixel, arm moving)
+        self.max_tf_lag = p("max_tf_lag", 0.05).value
+        self.n_tf_lag = 0
         cameras = p("cameras", list(DEFAULT_CAMERAS)).value
         style = p("topic_style", "gazebo").value  # gazebo | realsense (real robot)
         self.get_logger().info(f"target '{self.target.name}': HSV {self.target.hsv_ranges}, "
@@ -218,6 +222,15 @@ class RedBallDetector(Node):
             except TransformException as e:
                 self.get_logger().warn(f"TF {rgb_msg.header.frame_id} -> {self.target_frame}: {e}",
                                        throttle_duration_sec=2.0)
+                return
+            lag = abs((Time.from_msg(rgb_msg.header.stamp) - Time.from_msg(tf.header.stamp)).nanoseconds) * 1e-9
+            if lag > self.max_tf_lag:  # the camera moved since: the position would be wrong -> drop it
+                self.n_tf_lag += 1
+                self.get_logger().warn(
+                    f"no TF {rgb_msg.header.frame_id} -> {self.target_frame} at the image time; the latest is "
+                    f"{lag * 1000:.0f} ms off (> max_tf_lag {self.max_tf_lag * 1000:.0f} ms) -> detection dropped "
+                    f"({self.n_tf_lag} so far). Always? PC and robot clocks differ (chrony / NTP)",
+                    throttle_duration_sec=2.0)
                 return
         t, q = tf.transform.translation, tf.transform.rotation
         R, tr = quat_to_mat(q), np.array([t.x, t.y, t.z])

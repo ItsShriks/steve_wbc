@@ -229,6 +229,76 @@ def fit_table_lidar(lidar, robot, top_z, overhang=0.03, leg_r=0.025, max_yaw_deg
                "legs_robot": P, "leg_like": legs}
 
 
+def fit_table_template(lidar, robot, template, top_z, match_tol=0.05, max_dist=3.5):
+    """
+    Pose of a table of KNOWN shape (`template`: a saved TableModel with >= 3 legs, e.g. the lab
+    table's 5) from the LiDAR legs it can see: any 3 or more of them — a leg hidden behind another
+    one (seen from the scanner) no longer breaks the fit, as with fit_table_lidar's 4-corner
+    rectangle. Every pair of leg-like clusters is matched to every pair of template legs of the same
+    spacing; the rigid 2-D pose that brings the most template legs onto clusters (then the smallest
+    RMS, then the table extending away from the robot) wins.
+      lidar  M x 2 points (frame of `robot`), robot = ((x, y), yaw) in that frame
+    Returns (TableModel, info) or raises ValueError.
+    """
+    (rx, ry), ryaw = robot
+    Rr = np.array([[np.cos(ryaw), -np.sin(ryaw)], [np.sin(ryaw), np.cos(ryaw)]])
+    loc = (np.asarray(lidar, float) - [rx, ry]) @ Rr          # robot frame: x forward
+    front = loc[(loc[:, 0] > 0.3) & (loc[:, 0] < max_dist) & (np.abs(loc[:, 1]) < max_dist)]
+    clusters = lidar_clusters(front)
+    legs = [c.mean(0) for c in clusters if len(c) >= 3 and np.ptp(c, axis=0).max() < 0.10]
+    if len(legs) < 3:
+        raise ValueError(f"only {len(legs)} leg-like clusters in front of the robot")
+    legs = np.array(legs)[np.argsort(np.hypot(*np.array(legs).T))][:40]   # nearest 40
+    T = np.array([[lx, ly] for lx, ly, _ in template.legs], float)
+    if len(T) < 3:
+        raise ValueError(f"template '{template.name}' has {len(T)} legs (needs >= 3)")
+    hx, hy = 0.5 * template.size[0], 0.5 * template.size[1]
+    cands = []
+    for i in range(len(legs)):
+        for j in range(len(legs)):
+            if i == j:
+                continue
+            dij = legs[j] - legs[i]
+            for k in range(len(T)):
+                for m in range(len(T)):
+                    if k == m:
+                        continue
+                    dkm = T[m] - T[k]
+                    if abs(np.hypot(*dij) - np.hypot(*dkm)) > match_tol:
+                        continue
+                    th = np.arctan2(dij[1], dij[0]) - np.arctan2(dkm[1], dkm[0])
+                    R = np.array([[np.cos(th), -np.sin(th)], [np.sin(th), np.cos(th)]])
+                    t = 0.5 * (legs[i] + legs[j]) - R @ (0.5 * (T[k] + T[m]))
+                    W = T @ R.T + t                                # template legs, robot frame
+                    dist = np.min(np.linalg.norm(W[:, None] - legs[None], axis=2), axis=1)
+                    hit = dist < match_tol
+                    if hit.sum() < 3:
+                        continue
+                    # the robot is not under the table (top outline + 10 cm)
+                    o = R.T @ (-t)
+                    if abs(o[0]) < hx + 0.10 and abs(o[1]) < hy + 0.10:
+                        continue
+                    rms = float(np.sqrt(np.mean(dist[hit] ** 2)))
+                    cands.append((-int(hit.sum()), round(rms, 2), -float(np.hypot(*t)), rms, th, t, hit))
+    if not cands:
+        raise ValueError(f"the {len(T)}-leg layout of '{template.name}' matches no 3 of the "
+                         f"{len(legs)} leg-like clusters")
+    cands.sort(key=lambda c: c[:3])
+    n_hit, _, _, rms, th, t, hit = cands[0]
+    # a clearly different pose with as many legs and about the same error: ambiguous
+    rival = next((c for c in cands[1:] if c[0] == n_hit and c[3] < rms + 0.01
+                  and (np.hypot(*(c[5] - t)) > 0.10 or abs((c[4] - th + np.pi) % (2 * np.pi) - np.pi) > 0.2)), None)
+    table = TableModel(name=template.name, center=[float(v) for v in Rr @ t + [rx, ry]],
+                       yaw=float(ryaw + th), size=list(template.size), top_z=float(top_z),
+                       thickness=template.thickness, legs=[list(map(float, l)) for l in template.legs],
+                       skirt=template.skirt)
+    W = T @ np.array([[np.cos(th), -np.sin(th)], [np.sin(th), np.cos(th)]]).T + t
+    return table, {"lidar_under": front, "clusters": clusters, "shape_err": rms, "leg_like": legs,
+                   "legs_seen": int(hit.sum()), "legs_hidden": [i for i in range(len(T)) if not hit[i]],
+                   "legs_robot": W, "ambiguous": rival is not None,
+                   "candidates": [(c[3], c[5], np.degrees(c[4])) for c in cands[:5]]}
+
+
 def fit_table(cloud, lidar, robot_xy=(0.0, 0.0), z_range=(0.5, 1.3), leg_r=0.03):
     """
     Table from measurements in one frame (z up):
