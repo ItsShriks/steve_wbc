@@ -11,6 +11,7 @@ the calibration itself). The rest of the TF tree (odom -> ... -> ur5etool0) come
 
     ros2 launch steve_wbc gripper_camera.launch.py                      # first camera found
     ros2 launch steve_wbc gripper_camera.launch.py serial_no:=_909522061251 profile:=640x480x15   # USB 2
+    ros2 launch steve_wbc gripper_camera.launch.py initial_reset:=true    # USB control transfers time out
 """
 
 import os
@@ -51,7 +52,7 @@ def _setup(context):
             # parameter names: realsense2_camera 4.54 (workspace) | >= 4.55 (apt)
             "rgb_camera.profile": profile, "depth_module.profile": profile,
             "rgb_camera.color_profile": profile, "depth_module.depth_profile": profile,
-            "initial_reset": "false", "wait_for_device_timeout": "10.0",
+            "initial_reset": LaunchConfiguration("initial_reset").perform(context), "wait_for_device_timeout": "10.0",
         }.items())]
     f = calibration_file()
     if f is None:
@@ -77,5 +78,8 @@ def generate_launch_description():
         DeclareLaunchArgument("profile", default_value="848x480x30",
                               description="colour + depth profile WxHxFPS (D415 min. range ~0.31 m at 848x480, "
                                           "~0.45 m at 1280x720; 640x480x15 on USB 2)"),
+        DeclareLaunchArgument("initial_reset", default_value="false",
+                              description="hardware-reset the camera on start (helps when USB control "
+                                          "transfers time out, e.g. on macOS)"),
         OpaqueFunction(function=_setup),
     ])
