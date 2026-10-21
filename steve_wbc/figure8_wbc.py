@@ -339,7 +339,7 @@ def main(argv=None):
         sys.exit("figure8_wbc.py is the MuJoCo demo — use steve_figure8_wbc.py --mode ros on the robot")
 
     model_path = resolve_model(args.model)
-    model = load_model(model_path, intruder=args.sim_intruder is not None)
+    model = load_model(model_path, intruder=args.sim_intruder is not None, tool=args.tool)
     kin = WholeBodyKinematics(model)
     dt = 1.0 / args.rate
     if args.mode == "sim":

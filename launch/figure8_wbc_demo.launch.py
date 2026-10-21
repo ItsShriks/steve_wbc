@@ -27,7 +27,8 @@ def launch_setup(context: LaunchContext):
                            "  ros2 launch steve_wbc steve_figure8_wbc.launch.py use_sim_time:=false")
 
     phase = cfg("phase")
-    args = ["--mode", "sim", "--loops", cfg("loops"), "--scale", cfg("scale"), "--speed", cfg("speed")]
+    args = ["--mode", "sim", "--loops", cfg("loops"), "--scale", cfg("scale"), "--speed", cfg("speed"),
+            "--tool", cfg("tool")]
     if phase == "1":
         args.append("--phase1_only")
     elif phase == "2":
@@ -56,6 +57,8 @@ def generate_launch_description():
                               description="Must be true — this demo runs in MuJoCo"),
         DeclareLaunchArgument("headless", default_value="false", description="Run without the viewer"),
         DeclareLaunchArgument("phase", default_value="all", description="1, 2 or all"),
+        DeclareLaunchArgument("tool", default_value="robotiq_2f85",
+                              description="camera_only | robotiq_2f85 | dex5 (steve_grasping)"),
         DeclareLaunchArgument("loops", default_value="3", description="Figure-8 loops per phase"),
         DeclareLaunchArgument("scale", default_value="1.0", description="Amplitude multiplier"),
         DeclareLaunchArgument("speed", default_value="1.0", description="Frequency multiplier"),

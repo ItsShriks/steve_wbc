@@ -157,6 +157,25 @@ the real robot.
   (from the drive alone a slowly rolling ball looked static, and the robot drove around for nothing). Sim, `scene
   far`, grasp pose reached: 36.8 → 30.8 s; with `--max_base_v 0.10 --max_arm_vel 0.3`: 60.9 → 54.1 s
   (EE RMS 2.34 → 1.54 cm); min base clearance ≥ 18.9 cm.
+* **Continuous approach** (`--approach move`, **default**; `stop`: the old drive → stop → settle →
+  look → reach): the grasp is planned as soon as the object has been tracked for `--plan_span` (0.5 s),
+  **while driving** — side choice and IK check as before, then the base goes straight on to the chosen
+  side's stand-off (or around the table) as a base path that starts at the current speed (no braking
+  for the hand-over), the arm keeps the camera on the object and takes the VGN views on the way
+  (`--vgn_mode drive`), VGN starts on whatever views there are `--reach_lead` before the path ends, and
+  the arm reaches for the grasp while the base finishes the path: `DRIVE → REPOSITION → PRE_GRASP →
+  DESCEND → …` with no `SETTLE_ARM` / `COARSE_DETECT` / `VGN_SCAN` / `VGN_WAIT`. An object planned as
+  static that turns out to roll re-plans once (intercept from the nearest side). Those stop states remain
+  only as fallbacks (object never seen, VGN found no grasp → other side). Needs the table model (sim, or
+  `--table` on the robot); without it the robot drives up and reaches from the drive as before. The
+  summary shows the states and `robot (base + arm) still for X s before the grasp; stop-and-look
+  states: none`. In MuJoCo the persistent VGN worker is loaded before the run (`--no_vgn_worker`: one
+  process per inference), as on the robot where it loads while the robot starts.
+* **Tool on the flange** (`--tool`, launch `tool:=`, [`steve_grasping`](../steve_grasping/README.md)):
+  `camera_only` (the real robot now: D415 on the flange, no gripper → `--goto_grasp_only`, `grasp_dz`
+  0.05, launch defaults `camera_tilt:=25`, detector `gripper_camera`, MuJoCo `--sim_cameras wrist`),
+  `robotiq_2f85` (simulation default, the model used so far), `dex5` (provisional). Launch default:
+  `camera_only` with `use_sim_time:=false`, `robotiq_2f85` in simulation.
 * **Camera tilt** (`--camera_tilt DEG`): a camera looking along the flange axis sees only the
   floor / table straight below in the drive and scan poses (the MJCF wrist camera is mounted tilted);
   the tilt turns wrist 1 so it looks forward-down. With the gripper camera ~25° covers the table from

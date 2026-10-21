@@ -90,7 +90,10 @@ def launch_setup(context: LaunchContext):
     if simulator not in ("gazebo", "mujoco"):
         raise RuntimeError(f"simulator must be 'gazebo' or 'mujoco', got '{simulator}'")
     env = simulator if is_sim else "real"
-    print(f"[INFO] active_perception_wbc: environment = {env}")
+    # what is on the flange (steve_grasping): the real robot has only the D415 since 2026-10-14
+    tool = cfg("tool") or ("robotiq_2f85" if is_sim else "camera_only")
+    camera_only = tool == "camera_only"
+    print(f"[INFO] active_perception_wbc: environment = {env}, tool = {tool}, approach = {cfg('approach')}")
     if env == "real":
         warn_wifi_link()
     actions = []
@@ -121,10 +124,17 @@ def launch_setup(context: LaunchContext):
     if cfg("vgn").lower() != "true":
         args.append("--no_vgn")
     args += ["--vgn_mode", cfg("vgn_mode"), "--vgn_max_wait", cfg("vgn_max_wait")]
+    args += ["--tool", tool, "--approach", cfg("approach")]
+    # camera looking along the flange axis (D415 on the flange): tilt it forward in the drive / scan poses
+    tilt = cfg("camera_tilt") or ("25" if camera_only else "0")
+    if float(tilt):
+        args += ["--camera_tilt", tilt]
     if cfg("log"):
         args += ["--log", cfg("log")]
     if env == "mujoco":
         args += ["--mode", "sim", "--scene", cfg("scene")]
+        # like the robot: with the D415 on the flange the detector has only that camera
+        args += ["--sim_cameras", cfg("sim_cameras") or ("wrist" if camera_only else "wrist,head")]
         if cfg("headless").lower() == "true":
             args.append("--headless")
     else:
@@ -185,7 +195,8 @@ def launch_setup(context: LaunchContext):
         actions.append(Node(package="steve_perception", executable="model_server", name=f"model_server_{m}",
                             arguments=[m], output="screen", emulate_tty=True))
 
-    cameras = [c.strip() for c in cfg("detector_cameras").split(",") if c.strip()]
+    det_cams = cfg("detector_cameras") or ("gripper_camera" if camera_only else "pan_tilt_camera,wrist_camera")
+    cameras = [c.strip() for c in det_cams.split(",") if c.strip()]
     if env != "mujoco" and detector == "gsam":
         # object named by gsam_prompt, size and shape from the target profile (sphere fit for balls)
         try:
@@ -219,7 +230,7 @@ def launch_setup(context: LaunchContext):
                          # the D415 on the gripper via gripper_camera.launch.py on this PC)
                          "cameras": cameras,
                          # no pan-tilt head among them: do not command it
-                         **({} if "pan_tilt_camera" in cfg("detector_cameras") else {"head_topic": ""})}],
+                         **({} if "pan_tilt_camera" in det_cams else {"head_topic": ""})}],
         ))
     actions.append(Node(
         package="steve_wbc",
@@ -275,8 +286,22 @@ def generate_launch_description():
         DeclareLaunchArgument("table", default_value="",
                               description="measured table model (steve_wbc/config/tables, table_probe); "
                                           "robot: WBC collision model, MuJoCo: replaces the sim table"),
-        DeclareLaunchArgument("detector_cameras", default_value="pan_tilt_camera,wrist_camera",
-                              description="robot/Gazebo: cameras of the target detector, e.g. gripper_camera"),
+        DeclareLaunchArgument("detector_cameras", default_value="",
+                              description="robot/Gazebo: cameras of the target detector (default: gripper_camera "
+                                          "with tool camera_only, else pan_tilt_camera,wrist_camera)"),
+        DeclareLaunchArgument("tool", default_value="",
+                              description="what is on the flange (steve_grasping): camera_only | robotiq_2f85 | dex5 "
+                                          "(default: camera_only on the robot, robotiq_2f85 in simulation); "
+                                          "camera_only = go to the grasp pose only"),
+        DeclareLaunchArgument("approach", default_value="move",
+                              description="move: plan the grasp as soon as the object is tracked and go for it without "
+                                          "stopping (base + arm together) | stop: drive, stop, settle, look, reach"),
+        DeclareLaunchArgument("camera_tilt", default_value="",
+                              description="tilt of the drive / scan poses for a camera along the flange axis [deg] "
+                                          "(default: 25 with camera_only, else 0)"),
+        DeclareLaunchArgument("sim_cameras", default_value="",
+                              description="MuJoCo: detector cameras wrist,head (default: wrist only with camera_only, "
+                                          "like the robot)"),
         DeclareLaunchArgument("arm_interface", default_value="",
                               description="velocity | trajectory (default: velocity on the robot, trajectory in Gazebo)"),
         DeclareLaunchArgument("goto_grasp_only", default_value="false",

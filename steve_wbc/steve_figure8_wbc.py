@@ -104,6 +104,13 @@ except ImportError:  # plain python3 without the ROS workspace: the module from 
     sys.path.insert(0, str(SCRIPT_DIR.parents[1] / "steve_manipulation"))
     from steve_manipulation.safety_stop import (EM_STOP_TOPIC, SCAN_TOPICS, ClearTimer, EmStopMonitor,
                                                 LidarSafety, ScanPoints)
+try:  # tools on the flange (camera only, Robotiq 2F-85, Dex5-1) and their models
+    from steve_grasping.robot_model import compose as compose_tool
+    from steve_grasping.tools import DEFAULT_TOOL, TOOLS, load_tool
+except ImportError:  # plain python3 without the ROS workspace: the package from the source tree
+    sys.path.insert(0, str(SCRIPT_DIR.parents[1] / "steve_grasping"))
+    from steve_grasping.robot_model import compose as compose_tool
+    from steve_grasping.tools import DEFAULT_TOOL, TOOLS, load_tool
 MODEL_NAME = "mmo_700_wbc.xml"
 
 
@@ -130,11 +137,15 @@ INTRUDER = "intruder"
 INTRUDER_PARK = (50.0, 50.0)   # xy while the person is away
 
 
-def load_model(path, intruder=False, spec_edit=None):
-    """MuJoCo model from `path`, optionally with the test intruder and further scene edits."""
+def load_model(path, intruder=False, spec_edit=None, tool=None):
+    """MuJoCo model from `path` with `tool` (steve_grasping: camera_only | robotiq_2f85 | dex5, or a
+    ToolSpec; default $STEVE_TOOL or robotiq_2f85) at the flange, optionally with the test intruder and
+    further scene edits."""
+    tool = load_tool(tool) if tool is None or isinstance(tool, str) else tool
+    xml = compose_tool(path, tool)
     if not intruder and spec_edit is None:
-        return mujoco.MjModel.from_xml_path(str(path))
-    spec = mujoco.MjSpec.from_file(str(path))
+        return mujoco.MjModel.from_xml_string(xml)
+    spec = mujoco.MjSpec.from_string(xml)
     if intruder:
         body = spec.worldbody.add_body(name=INTRUDER, mocap=True, pos=[*INTRUDER_PARK, 0.85])
         body.add_geom(name=f"{INTRUDER}_geom", type=mujoco.mjtGeom.mjGEOM_CYLINDER, size=[0.15, 0.85, 0],
@@ -1931,6 +1942,9 @@ def build_arg_parser(description="Steve figure-8 unified velocity-level WBC (MuJ
     g.add_argument("--mode", choices=["sim", "kin", "ros"], default="sim")
     g.add_argument("--dry_run", action="store_true", help="ros mode: read real state, publish nothing")
     g.add_argument("--model", type=Path, default=None, help="path to mmo_700_wbc.xml")
+    g.add_argument("--tool", default=DEFAULT_TOOL,
+                   help=f"what is on the flange (steve_grasping/config/tools): {' | '.join(TOOLS)} — its model "
+                        "(collision geometry, grasp point `pinch`, wrist camera) is attached to the robot model")
     g.add_argument("--log", type=str, default=None, help="write CSV log to this path")
 
     g = p.add_argument_group("trajectory")
@@ -2129,8 +2143,10 @@ def main(argv=None):
         args.collision_env = "model"   # the table is the (only) static obstacle of the model
         print(f"Table: {t.name}  centre {np.round(t.center, 3)} ({t.frame})  size {np.round(t.size, 2)} m  "
               f"top {t.top_z:.2f} m  {len(t.legs)} legs")
+    print(f"Tool: {load_tool(args.tool)}")
     model = load_model(model_path, intruder=args.sim_intruder is not None,
-                       spec_edit=args.table_model.apply_to_spec if args.table_model is not None else None)
+                       spec_edit=args.table_model.apply_to_spec if args.table_model is not None else None,
+                       tool=args.tool)
     kin = WholeBodyKinematics(model)
 
     if args.mode == "sim":
