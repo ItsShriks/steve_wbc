@@ -16,7 +16,7 @@ Usage:
     ros2 launch steve_wbc active_perception_wbc.launch.py scene:=clutter   # cube among obstacles
     ros2 launch steve_wbc active_perception_wbc.launch.py scene:=far       # drive around the table
     ros2 launch steve_wbc active_perception_wbc.launch.py vgn_mode:=async  # = ..._vgn_async.launch.py
-    ros2 launch steve_wbc active_perception_wbc.launch.py vgn_mode:=drive  # = ..._vgn_drive.launch.py
+    ros2 launch steve_wbc active_perception_wbc.launch.py vgn_mode:=scan   # original stopped scan
     ros2 launch steve_wbc active_perception_wbc.launch.py use_sim_time:=false dry_run:=true
     ros2 launch steve_wbc active_perception_wbc.launch.py use_sim_time:=false launch_bringup:=false \\
         target_topic:=/steve_perception/target_point
@@ -260,10 +260,10 @@ def generate_launch_description():
         DeclareLaunchArgument("vgn", default_value="true",
                               description="VGN grasp scan (needs the vgn_env conda env on this PC; robot: wrist-camera "
                                           "views, no grasp -> explore other table sides)"),
-        DeclareLaunchArgument("vgn_mode", default_value="scan",
-                              description="MuJoCo VGN timing: scan (stop, scan, wait for inference) | "
-                                          "async (same scan, inference in the background) | "
-                                          "drive (views while driving up, inference in the background)"),
+        DeclareLaunchArgument("vgn_mode", default_value="drive",
+                              description="VGN timing (MuJoCo and robot): drive (default; views while driving "
+                                          "up, inference in the background) | scan (stop, scan, wait for "
+                                          "inference) | async (same scan, inference in the background)"),
         DeclareLaunchArgument("vgn_max_wait", default_value="5.0",
                               description="async/drive: max hover at the pre-grasp for a running VGN [s]"),
         DeclareLaunchArgument("scan_topic", default_value="/lidar_1/scan_filtered",

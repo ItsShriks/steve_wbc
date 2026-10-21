@@ -90,9 +90,14 @@ the real robot.
 
   | Mode | Launch file | Views | Inference | Robot waits |
   |---|---|---|---|---|
-  | `scan` (original) | `active_perception_wbc.launch.py` | stopped 4-view pan scan | blocking | scan + inference |
+  | `scan` (original) | `active_perception_wbc.launch.py vgn_mode:=scan` | stopped 4-view pan scan | blocking | scan + inference |
   | `async` | `active_perception_wbc_vgn_async.launch.py` | stopped 4-view pan scan | background | scan only |
-  | `drive` | `active_perception_wbc_vgn_drive.launch.py` | while driving up (motion-compensated) | background, starts while driving | ~0 |
+  | `drive` (**default**, sim and robot) | `active_perception_wbc.launch.py` | while driving up (motion-compensated) | background, starts while driving | ~0 |
+
+  On the robot a drive view's camera pose is taken from TF at the frame's capture time: the frame's age
+  on the PC clock (camera node on the PC) back from the newest TF (robot and PC clocks differ, so the
+  image stamp itself cannot be looked up; at most `MAX_VIEW_AGE` 0.3 s). With the D415, `--vgn_drive_range
+  1.2` keeps the drive views within its usable depth.
 
   Inference time is charged 1:1 to simulation time, so the modes compare fairly
   (`python3 test/compare_vgn_modes.py`). A result arriving after the descent started is ignored;
@@ -139,6 +144,19 @@ the real robot.
   table is a rounded ring (straight sides + quarter circles, constant distance, base facing the
   table). Sim, `scene far` (3.5 m round): 0.10 → 36 s, 0.20 → 19 s, 0.30 → 14 s, 0.40 → 11 s, min
   base clearance 16.2–16.8 cm at every speed (≥ 15 cm `--d_safe_base`, a hard QP constraint).
+* **Reach on the move** (`--reach_lead`, default 3 s; 0: the old stop → settle → reach): after a drive
+  around the table the arm starts for the grasp `--reach_lead` before the base path ends instead of
+  waiting for the base to stop and the arm to settle (`REPOSITION → PRE_GRASP` directly). The rest of
+  the path stays the base task in `PRE_GRASP` / `DESCEND` / `GRASP` / `AT_GRASP` (below the EE task in
+  the hierarchy); the soft hold afterwards is at the path's end. Only when no stopped grasp scan is
+  needed first (VGN off, or its inference already running / done, or — `drive` mode — enough views from
+  the drive to start it) and the object is tracked (a static one may be out of view up to
+  `--lost_timeout_static`, as in `PRE_GRASP`). Also while driving up to the table (in the LiDAR slow
+  zone), but only for an object on the near half (grasped from the arrival side); for one elsewhere the
+  robot stops first: the still detections at the table are what tell a rolling object from a static one
+  (from the drive alone a slowly rolling ball looked static, and the robot drove around for nothing). Sim, `scene
+  far`, grasp pose reached: 36.8 → 30.8 s; with `--max_base_v 0.10 --max_arm_vel 0.3`: 60.9 → 54.1 s
+  (EE RMS 2.34 → 1.54 cm); min base clearance ≥ 18.9 cm.
 * **Camera tilt** (`--camera_tilt DEG`): a camera looking along the flange axis sees only the
   floor / table straight below in the drive and scan poses (the MJCF wrist camera is mounted tilted);
   the tilt turns wrist 1 so it looks forward-down. With the gripper camera ~25° covers the table from

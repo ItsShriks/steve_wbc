@@ -1243,8 +1243,12 @@ class MujocoSimBackend(Backend):
         for s in self.lidar_sites:
             o = d.site_xpos[s].copy()
             # exclude the scanner's own body: the rays start inside its mesh
-            mujoco.mj_multiRay(m, d, o, self.lidar_dirs.flatten(), self._ray_groups, 1, m.site_bodyid[s],
-                               self._ray_id, self._ray_d, None, len(self.lidar_dirs), 10.0)
+            ray_args = (m, d, o, self.lidar_dirs.flatten(), self._ray_groups, 1, int(m.site_bodyid[s]),
+                        self._ray_id, self._ray_d)
+            try:
+                mujoco.mj_multiRay(*ray_args, None, len(self.lidar_dirs), 10.0)
+            except TypeError:  # MuJoCo < 3.4: no `normal` output argument
+                mujoco.mj_multiRay(*ray_args, len(self.lidar_dirs), 10.0)
             hit = self._ray_id >= 0
             hit[hit] &= ~self.robot_body[m.geom_bodyid[self._ray_id[hit]]]
             pw = o + self._ray_d[hit, None] * self.lidar_dirs[hit]

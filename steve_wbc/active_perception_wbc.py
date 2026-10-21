@@ -159,6 +159,8 @@ PREGRASP_TIMEOUT = 12.0       # s  pre-grasp not reached from this side -> repla
 RING_MARGIN = 0.05            # m  ring around the table: clear at any heading, + this
 REPOSITION_SPEED = 0.25       # m/s along the ring (--orbit_speed; capped by --max_base_v)
 ORBIT_ACC = 0.25              # m/s^2 ramps of repositioning paths (trapezoidal speed; QP limit 0.5)
+REACH_LEAD = 3.0              # s  reach on the move: the arm starts this long before the base path ends
+ORBIT_STATES = ("PRE_GRASP", "DESCEND", "GRASP", "AT_GRASP")   # states that keep tracking the base path
 
 # ── Continuous operation (--continuous): after an episode the robot watches the table and goes for
 # the object again once it has been put down somewhere else ──
@@ -184,6 +186,7 @@ LOS_NEAR = 0.6                # m  map columns within this (xy) of the object en
 # Table quadrants as seen from the side the robot arrives on (bottom = near half, top = far half,
 # left / right from the robot's view) -> side of the table to grasp from. "here" = stay.
 VIEW_TIMEOUT = 3.0            # s  real camera: no depth frame + TF for a VGN view -> skip the view
+MAX_VIEW_AGE = 0.3            # s  real camera: frame age taken back from the newest TF (clamped)
 NO_GRASP = "no grasp candidate found"
 GOTO_DONE = "reached grasp pose"   # --goto_grasp_only
 MPC_LEASH = 0.04              # m    EE reference at most this far ahead of the real EE
@@ -628,11 +631,24 @@ class WristDepthGrabber:
         else:
             d = np.frombuffer(m.data, np.float32).reshape(m.height, m.width).copy()
         from rclpy.time import Time
+        frame = m.header.frame_id or self.frame_id
         try:
-            tr = self.tf.lookup_transform("odom", m.header.frame_id or self.frame_id, Time())
+            tr = self.tf.lookup_transform("odom", frame, Time())
         except Exception as e:
             self.log.warn(f"VGN view skipped: no TF odom <- {m.header.frame_id}: {e}")
             return None
+        # taken while driving: the camera moved since the frame was captured. Robot (TF) and PC
+        # (camera) clocks differ, so the image stamp cannot be looked up in TF directly; the frame's
+        # age on the PC clock, taken back from the newest TF, can (TF arrives within a few ms)
+        age = (self.node.get_clock().now().nanoseconds - Time.from_msg(m.header.stamp).nanoseconds) * 1e-9
+        age = float(np.clip(age, 0.0, MAX_VIEW_AGE))
+        if age > 0.005:
+            from rclpy.duration import Duration
+            t_cap = Time.from_msg(tr.header.stamp) - Duration(nanoseconds=int(age * 1e9))
+            try:
+                tr = self.tf.lookup_transform("odom", frame, t_cap)
+            except Exception:
+                pass  # older than the TF buffer / not interpolable: the newest pose
         q, tt = tr.transform.rotation, tr.transform.translation
         x, y, z, w = q.x, q.y, q.z, q.w
         R = np.array([[1 - 2 * (y * y + z * z), 2 * (x * y - z * w), 2 * (x * z + y * w)],
@@ -1152,6 +1168,8 @@ class ActivePerceptionWBC:
     # ── helpers ─────────────────────────────────────────────────────────────
     def _enter(self, state, msg=""):
         print(f"\n[{self.state} → {state}] {msg}")
+        if state not in ORBIT_STATES:
+            self.orbit_t0 = None
         self.state, self.t_state = state, self.t
 
     def _settled(self, st, q_ref, tol=0.02):
@@ -1311,6 +1329,49 @@ class ActivePerceptionWBC:
         """Object path known well enough to act on (recent, several detections)."""
         return self.tracker.p is not None and len(self.tracker.hist) >= 5 and self.t - self.last_seen < 1.0
 
+    def _reach_on_move(self):
+        """The arm may start for the grasp while the base still moves (--reach_lead > 0): the object
+        is tracked and no stopped grasp scan has to come first (VGN off, or its inference already
+        running / done — the condition under which _begin_grasp_planning goes straight to PRE_GRASP).
+        A static object may be out of view for a while, as in PRE_GRASP (the base turning towards the
+        table at the end of a slow orbit: no detections for ~4 s at 0.1 m/s)."""
+        if self.a.reach_lead <= 0 or self.watching or self.tracker.p is None or len(self.tracker.hist) < 5:
+            return False
+        static = not np.any(self.tracker.v)
+        if self.t - self.last_seen >= (self.a.lost_timeout_static if static else 1.0):
+            return False
+        if self.w.vgn_available():
+            # (drive mode: enough views from the drive -> _begin_grasp_planning starts the inference)
+            return (self.vgn_pending or self.vgn_result is not None
+                    or (self.a.vgn_mode == "drive" and not self.explored and self.vgn_t0 is not None
+                        and self.w.vgn_n_views() >= self._drive_views()[0]))
+        return not self.w.vgn_checking()
+
+    def _reach_from_drive(self, st):
+        """Reach on the move while still driving up to the table: only for an object the robot grasps
+        from the side it arrives on (near half of the table). Elsewhere it stops first — the still
+        detections at the table are what tell a rolling object from a static one (from the drive
+        alone a slowly rolling ball looked static, in the far half: a needless drive around)."""
+        if not self._reach_on_move():
+            return False
+        if not self._can_plan():
+            return True
+        lo, hi = self.w.support_rect()
+        here = self._side_of(st.base, lo, hi)
+        _, preferred = table_quadrant(self.tracker.predict(self.t)[:2], lo, hi, self.arrival_side or here)
+        return preferred == here
+
+    def _orbit_ref(self):
+        """Reach on the move: the rest of the base path as the base task while the arm already goes
+        for the grasp; None once it has run out (base_hold is its end pose)."""
+        if self.orbit_t0 is None:
+            return None
+        ref, done = self.base_path.at(self.t - self.orbit_t0)
+        if done:
+            self.orbit_t0, self.base_path = None, []
+            return None
+        return ref
+
     def _perceive(self):
         """Perception runs in every phase from the start of the run: the head (pan-tilt)
         camera while driving, then wrist and head camera alternately. Every detection
@@ -1379,6 +1440,14 @@ class ActivePerceptionWBC:
             speed = (a.drive_speed if front > a.d_safe_base + LIDAR_SLOW_MARGIN
                      else SLOW_SPEED if front > stop_d else 0.0)
             travelled = np.linalg.norm(st.base[:2] - self.drive_start[:2])
+            if speed > 0.0 and front <= a.d_safe_base + LIDAR_SLOW_MARGIN and self._reach_from_drive(st):
+                # reach on the move: plan the grasp while still rolling up to the table, no stop + settle;
+                # PRE_GRASP leaves the base to the QP (it brakes within its acceleration limit)
+                self.base_hold = st.base.copy()
+                self._begin_grasp_planning(st, f"LiDAR {front:.3f} m, still driving | object tracked since "
+                                               f"t={self.tracker.hist[0][0]:.1f} s")
+                if self.state != "DRIVE":
+                    return None, BaseReference(st.base.copy(), np.zeros(3)), DRIVE_POSE
             if speed == 0.0 or travelled >= a.max_drive:
                 self.base_hold, self.backup_start = st.base.copy(), st.base.copy()
                 why = f"LiDAR {front:.3f} m" if front <= stop_d else f"travelled {travelled:.2f} m"
@@ -1413,6 +1482,14 @@ class ActivePerceptionWBC:
                 return None, BaseReference(self.base_hold, np.zeros(3)), DRIVE_POSE
             ref, done = self.base_path.at(ts)
             err = np.linalg.norm(ref.pose[:2] - st.base[:2])
+            if self.placed and ts >= self.base_path.T - a.reach_lead and self._reach_on_move():
+                # reach on the move: the arm goes for the grasp while the base drives the rest of the
+                # path; the grasp states keep tracking it as the base task (_orbit_ref)
+                self.orbit_t0, self.base_hold = self.t_state, self.base_path.at(np.inf)[0].pose.copy()
+                self._begin_grasp_planning(st, f"arriving at the {self.side} side "
+                                               f"({max(self.base_path.T - ts, 0.0):.1f} s to go), base still moving")
+                if self.state != "REPOSITION":
+                    return None, ref, DRIVE_POSE
             if done and err < 0.02 and abs(wrap_angle(ref.pose[2] - st.base[2])) < 0.03:
                 self.base_hold, self.base_path = ref.pose.copy(), []
                 self._enter("SETTLE_ARM", f"at the {self.side} side")
@@ -1546,14 +1623,15 @@ class ActivePerceptionWBC:
                 if (np.linalg.norm(self.ee - goal) < 0.01 and np.linalg.norm(self.mpc.v - v_obj) < 0.01
                         and ts > 1.0 and not self._vgn_hover()):
                     a.d_safe = a.d_safe_grasp  # fingers may come close to the table now
-                    self.base_hold = st.base.copy()  # the arm does the final centimetres
+                    if self.orbit_t0 is None:  # (on the move: base_hold is already the path's end)
+                        self.base_hold = st.base.copy()  # the arm does the final centimetres
                     self._enter("DESCEND", f"moving with the object above it | margin -> {a.d_safe_grasp * 100:.1f} cm")
                 elif ts > PREGRASP_TIMEOUT and self._can_plan():
                     # e.g. oscillating at the edge of the workspace: another side instead
                     self._replan(st, f"pre-grasp not reached in {PREGRASP_TIMEOUT:.0f} s")
                 elif ts > 30.0:
                     self._end_episode("pre-grasp not reached", failed=True)
-                return ref, None, ARM_HOME_Q
+                return ref, self._orbit_ref(), ARM_HOME_Q
 
             if self.state == "RETREAT":  # --goto_grasp_only: back up above the object, then done
                 up = [0.0, 0.0, PREGRASP_HEIGHT]
@@ -1602,7 +1680,9 @@ class ActivePerceptionWBC:
                 self.lift_goal = self.ee + [0, 0, LIFT_HEIGHT]
                 self._enter("LIFT", f"margin -> {self.d_safe * 100:.1f} cm")
             # soft base hold: a base still driving while the fingers close bumps the object away
-            return ref, hold, ARM_HOME_Q
+            # (reach on the move: the rest of the base path first, then the hold at its end)
+            orbit = self._orbit_ref()
+            return ref, orbit if orbit is not None else BaseReference(self.base_hold, np.zeros(3)), ARM_HOME_Q
 
         if self.state == "LIFT":
             ref = self.mpc.step(self.lift_goal, np.zeros(3), np.zeros(3), self.grasp_R, 0.4, 0.08, dt)
@@ -1684,7 +1764,7 @@ class ActivePerceptionWBC:
         self.vgn_center, self.view_wait_t0 = None, None
         self.explored, self.explore_why = [], None  # table sides where VGN found no grasp
         self.hold_slip, self.at_grasp_err, self.released = 0.0, None, False
-        self.mpc = None
+        self.mpc, self.orbit_t0 = None, None  # orbit_t0: start time of base_path while reaching on the move
 
     def _object_found(self, st, why):
         """Object tracked after a search: plan the grasp — or, while watching, first make sure it has
@@ -2166,6 +2246,7 @@ class ActivePerceptionWBC:
         """The grasp got blocked from this side: try another one."""
         self.bad_sides.add(self.side)
         self.placed, self.mpc, self.transit_z = False, None, None
+        self.base_path, self.orbit_t0 = [], None
         self.a.d_safe = self.d_safe
         print(f"  {why} -> {self.side} side marked unusable, replanning")
         self._begin_grasp_planning(st, why)
@@ -2226,6 +2307,8 @@ class ActivePerceptionWBC:
                         self.t_state += stopped_for
                         if self.vgn_hover_t0 is not None:
                             self.vgn_hover_t0 += stopped_for
+                        if self.orbit_t0 is not None:
+                            self.orbit_t0 += stopped_for
                         stop_t0 = None
                 self.t = self.b.now() - self.t0
                 self.kin.set_state(st)
@@ -2445,9 +2528,9 @@ def main(argv=None):
                    help="robot: save every grasp scan (views with target mask + grasps, .jpg/.npz) to "
                         "<dir>/grasp_scan — auto: the launch's log folder ($STEVE_LAUNCH_LOG_DIR) or "
                         "~/ros_logs/perception_<time>; '' : off")
-    g.add_argument("--vgn_mode", choices=["scan", "async", "drive"], default="scan",
+    g.add_argument("--vgn_mode", choices=["scan", "async", "drive"], default="drive",
                    help="scan: stop, scan, wait for inference (original) | async: same scan, inference "
-                        "in the background | drive: views while driving up, inference in the background")
+                        "in the background | drive (default): views while driving up, inference in the background, from the start of the run")
     g.add_argument("--vgn_max_wait", type=float, default=5.0,
                    help="async/drive: max time to hover at the pre-grasp for a running VGN inference [s] "
                         "(0: never wait, grasp without a late result)")
@@ -2499,6 +2582,10 @@ def main(argv=None):
     g.add_argument("--sim_seed", type=int, default=0, help="--continuous, sim: seed of the object placements")
     g.add_argument("--orbit_speed", type=float, default=REPOSITION_SPEED,
                    help="base speed around the table [m/s] (capped by --max_base_v)")
+    g.add_argument("--reach_lead", type=float, default=REACH_LEAD,
+                   help="reach on the move: the arm starts for the grasp this long before the base path around "
+                        "the table ends, if no stopped VGN scan is needed first [s] (0: base stops and the arm "
+                        "settles first)")
     g.add_argument("--d_safe_grasp", type=float, default=0.005, help="collision margin for the final descent [m]")
     g.add_argument("--search_timeout", type=float, default=30.0, help="[s]")
     g.add_argument("--lost_timeout", type=float, default=3.0, help="abort if a moving object is unseen for [s]")
