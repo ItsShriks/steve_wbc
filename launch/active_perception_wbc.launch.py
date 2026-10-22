@@ -93,6 +93,8 @@ def launch_setup(context: LaunchContext):
     # what is on the flange (steve_grasping): the real robot has only the D415 since 2026-10-14
     tool = cfg("tool") or ("robotiq_2f85" if is_sim else "camera_only")
     camera_only = tool == "camera_only"
+    # the real robot's only camera is the D415 on the flange — also with a hand there (ability_hand)
+    flange_cam = camera_only or env == "real"
     print(f"[INFO] active_perception_wbc: environment = {env}, tool = {tool}, approach = {cfg('approach')}")
     if env == "real":
         warn_wifi_link()
@@ -128,7 +130,7 @@ def launch_setup(context: LaunchContext):
     if cfg("dynamic").lower() == "true":  # moving objects (rolling ball); off: the static behaviour
         args.append("--dynamic")
     # wrist-camera detections closer than the depth range are wrong (the D415 on the real flange: ~0.3 m)
-    min_rng = cfg("min_detect_range") or ("0.30" if env == "real" and camera_only else "")
+    min_rng = cfg("min_detect_range") or ("0.30" if env == "real" and flange_cam else "")
     if min_rng:
         args += ["--min_detect_range", min_rng]
     # base <-> table legs: the real robot needs more than the 15 cm of the model — the scanners' protective
@@ -137,7 +139,7 @@ def launch_setup(context: LaunchContext):
     if d_base:
         args += ["--d_safe_base", d_base]
     # camera looking along the flange axis (D415 on the flange): tilt it forward in the drive / scan poses
-    tilt = cfg("camera_tilt") or ("25" if camera_only else "0")
+    tilt = cfg("camera_tilt") or ("25" if flange_cam else "0")
     if float(tilt):
         args += ["--camera_tilt", tilt]
     if cfg("log"):
@@ -146,6 +148,11 @@ def launch_setup(context: LaunchContext):
         args += ["--mode", "sim", "--scene", cfg("scene")]
         # like the robot: with the D415 on the flange the detector has only that camera
         args += ["--sim_cameras", cfg("sim_cameras") or ("wrist" if camera_only else "wrist,head")]
+        if cfg("use_rviz").lower() == "true":  # MuJoCo -> RViz (steve_wbc/mujoco_rviz.py): TF of every body + scene
+            args.append("--rviz")
+            actions.append(Node(package="rviz2", executable="rviz2", name="rviz_mujoco", output="log",
+                                arguments=["-d", os.path.join(get_package_share_directory("steve_wbc"), "config",
+                                                              "rviz", "mujoco.rviz")]))
         if cfg("headless").lower() == "true":
             args.append("--headless")
     else:
@@ -202,11 +209,17 @@ def launch_setup(context: LaunchContext):
     if env != "mujoco" and cfg("model_servers").lower() != "false":
         servers += ["gsam"] if detector == "gsam" or (backend == "cgn" and cfg("vgn").lower() == "true") else []
         servers += ["cgn"] if backend == "cgn" and cfg("vgn").lower() == "true" else []
+    if env == "real" and tool == "ability_hand" and cfg("launch_hand").lower() == "true":
+        # the Ability Hand: ah_node (serial) + the GripperCommand bridge the WBC closes / opens it through
+        actions.append(IncludeLaunchDescription(
+            PythonLaunchDescriptionSource(os.path.join(get_package_share_directory("steve_grasping"), "launch",
+                                                       "ability_hand.launch.py")),
+            launch_arguments={"port": cfg("hand_port"), "simulated_hand": cfg("hand_simulated")}.items()))
     for m in servers:
         actions.append(Node(package="steve_perception", executable="model_server", name=f"model_server_{m}",
                             arguments=[m], output="screen", emulate_tty=True))
 
-    det_cams = cfg("detector_cameras") or ("gripper_camera" if camera_only else "pan_tilt_camera,wrist_camera")
+    det_cams = cfg("detector_cameras") or ("gripper_camera" if flange_cam else "pan_tilt_camera,wrist_camera")
     cameras = [c.strip() for c in det_cams.split(",") if c.strip()]
     if env != "mujoco" and detector == "gsam":
         # object named by gsam_prompt, size and shape from the target profile (sphere fit for balls)
@@ -268,7 +281,8 @@ def generate_launch_description():
         DeclareLaunchArgument("robot_ip", default_value=str(ROBOT_CFG["network"]["ur_robot_ip"]), description="UR5e IP (robot_config.yaml)"),
         DeclareLaunchArgument("gripper_hw", default_value="none",
                               description="Physical robot gripper: none, mock or robotiq_driver"),
-        DeclareLaunchArgument("use_rviz", default_value="false", description="RViz (Gazebo / robot)"),
+        DeclareLaunchArgument("use_rviz", default_value="false",
+                              description="RViz: Gazebo / robot; MuJoCo: the simulated scene and the WBC's markers"),
         DeclareLaunchArgument("headless", default_value="false", description="MuJoCo without viewer"),
         DeclareLaunchArgument("dry_run", default_value="false",
                               description="Read the robot state but publish no commands"),
@@ -300,6 +314,12 @@ def generate_launch_description():
         DeclareLaunchArgument("detector_cameras", default_value="",
                               description="robot/Gazebo: cameras of the target detector (default: gripper_camera "
                                           "with tool camera_only, else pan_tilt_camera,wrist_camera)"),
+        DeclareLaunchArgument("launch_hand", default_value="true",
+                              description="robot with tool:=ability_hand: start ah_node + the GripperCommand bridge "
+                                          "(steve_grasping ability_hand.launch.py); false: running elsewhere"),
+        DeclareLaunchArgument("hand_port", default_value="", description="Ability Hand serial port (empty: auto)"),
+        DeclareLaunchArgument("hand_simulated", default_value="false",
+                              description="ah_node's virtual hand (no hardware): test the gripper path"),
         DeclareLaunchArgument("dynamic", default_value="false",
                               description="true: moving objects — camera kept on the object up to the descent, "
                                           "re-acquire, velocity while driving (active_perception_wbc --dynamic)"),
@@ -307,7 +327,7 @@ def generate_launch_description():
                               description="ignore wrist-camera detections closer than this [m] (default: 0.30 with the "
                                           "D415 of tool camera_only on the robot, else off)"),
         DeclareLaunchArgument("tool", default_value="",
-                              description="what is on the flange (steve_grasping): camera_only | robotiq_2f85 | dex5 "
+                              description="what is on the flange (steve_grasping): camera_only | robotiq_2f85 | dex5 | ability_hand "
                                           "(default: camera_only on the robot, robotiq_2f85 in simulation); "
                                           "camera_only = go to the grasp pose only"),
         DeclareLaunchArgument("d_safe_base", default_value="",

@@ -1,0 +1,50 @@
+Panels:
+  - Class: rviz_common/Displays
+    Name: Displays
+Visualization Manager:
+  Class: ""
+  Displays:
+    - Class: rviz_default_plugins/Grid
+      Name: Grid
+      Enabled: true
+      Cell Size: 0.5
+      Plane Cell Count: 20
+      Reference Frame: world
+    - Class: rviz_default_plugins/MarkerArray
+      Name: MuJoCo scene
+      Enabled: true
+      Topic:
+        Value: /mujoco/scene
+        Durability Policy: Transient Local
+        Reliability Policy: Reliable
+        Depth: 1
+    - Class: rviz_default_plugins/MarkerArray
+      Name: WBC (object, path, goal, EE)
+      Enabled: true
+      Topic:
+        Value: /mujoco/wbc
+        Durability Policy: Volatile
+        Reliability Policy: Reliable
+        Depth: 5
+    - Class: rviz_default_plugins/TF
+      Name: TF
+      Enabled: false
+      Show Names: false
+  Global Options:
+    Fixed Frame: world
+    Frame Rate: 30
+  Tools:
+    - Class: rviz_default_plugins/MoveCamera
+    - Class: rviz_default_plugins/Select
+    - Class: rviz_default_plugins/Measure
+  Views:
+    Current:
+      Class: rviz_default_plugins/Orbit
+      Distance: 4.5
+      Focal Point: {X: 1.0, Y: 0.0, Z: 0.6}
+      Pitch: 0.55
+      Yaw: 3.6
+      Target Frame: world
+Window Geometry:
+  Width: 1400
+  Height: 900

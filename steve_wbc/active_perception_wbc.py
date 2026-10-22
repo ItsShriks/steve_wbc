@@ -1497,6 +1497,18 @@ class ActivePerceptionWBC:
                     + f" -> searching from the {name} side ({length:.1f} m)")
         return True
 
+    def _viz_update(self, ee_ref):
+        """--rviz: the simulated scene and what the WBC believes (object estimate, its path, goal, references)."""
+        w = {"ee": self.ee, "ee_ref": None if ee_ref is None else ee_ref.p,
+             "text": f"{self.state}  t={self.t:.1f}s", "text_at": self.ee + [0.0, 0.0, 0.25]}
+        if self.tracker.p is not None:
+            obj = self.tracker.predict(self.t)
+            w["object"] = obj
+            w["goal"] = obj + [0.0, 0.0, self.a.grasp_dz]
+            if np.any(self.tracker.v):
+                w["path"] = [self.tracker.predict(self.t + k * 0.2) for k in range(16)]
+        self.viz.update(self.b.data, w)
+
     def _dyn_hover(self):
         """--dynamic: pre-grasp height [m above the object] at which the wrist camera stays outside its
         minimum depth range (+ dyn_cam_clearance) — it keeps measuring the object up to the descent
@@ -2091,17 +2103,24 @@ class ActivePerceptionWBC:
         if self.state == "HOLD":  # keep the object up: a grasp that slips drops it here
             ref = self.mpc.step(self.lift_goal, np.zeros(3), np.zeros(3), self.grasp_R, 0.4, 0.08, dt)
             gt = self.w.ground_truth()
+            # where the object should stay: the grasp point (gripper), or — tool config hold_ref: lifted, a hand
+            # whose wrap pulls the object into the palm — where it sat in the hand when the lift ended
+            if gt is not None and getattr(self, "hold_off", None) is None:
+                self.hold_off = (gt - self.ee if a.tool_spec.config.get("hold_ref") == "lifted"
+                                 else np.array([0.0, 0.0, -a.grasp_dz]))
             if gt is not None:
-                self.hold_slip = max(self.hold_slip, np.linalg.norm(gt - (self.ee - [0, 0, a.grasp_dz])))
+                self.hold_slip = max(self.hold_slip, np.linalg.norm(gt - (self.ee + self.hold_off)))
             if ts >= a.hold_time:
                 if gt is None:
                     self.result = "done"
                     self._end_episode("hold complete")
                 else:
-                    held = gt[2] > 0.90 and np.linalg.norm(gt - (self.ee - [0, 0, a.grasp_dz])) < HOLD_TOL
+                    held = gt[2] > 0.90 and np.linalg.norm(gt - (self.ee + self.hold_off)) < HOLD_TOL
+                    where = "the grasp point" if a.tool_spec.config.get("hold_ref") != "lifted" else \
+                        "where it was held after the lift"
                     self.result = "success" if held else "dropped after the lift"
                     self._end_episode(f"after {a.hold_time:.1f} s: object z = {gt[2]:.3f} m, "
-                                      f"max {self.hold_slip * 100:.1f} cm from the grasp point -> "
+                                      f"max {self.hold_slip * 100:.1f} cm from {where} -> "
                                       + ("HELD" if held else "DROPPED / SLIPPED"))
             return ref, hold, ARM_HOME_Q
 
@@ -2153,7 +2172,7 @@ class ActivePerceptionWBC:
         self.vgn_center, self.view_wait_t0 = None, None
         self.vgn_side_views0, self.vgn_launch_views, self.view_ready_t0 = 0, 0, None
         self.explored, self.explore_why = [], None  # table sides where VGN found no grasp
-        self.hold_slip, self.at_grasp_err, self.released = 0.0, None, False
+        self.hold_slip, self.at_grasp_err, self.released, self.hold_off = 0.0, None, False, None
         self.mpc, self.orbit_t0 = None, None  # orbit_t0: start time of base_path while reaching on the move
         # --approach move: the plan assumed a static object / the side the robot was at when planning;
         # a moving object found later re-plans once
@@ -2894,6 +2913,13 @@ class ActivePerceptionWBC:
               f"{getattr(a, 'object_type', '-')}   collision env: {a.collision_env}")
 
         try:
+            self.viz = None
+            if a.rviz and self.sim:  # MuJoCo -> RViz (TF of every body, the scene, the WBC's markers)
+                try:
+                    from steve_wbc.mujoco_rviz import MujocoRviz
+                except ImportError:
+                    from mujoco_rviz import MujocoRviz
+                self.viz = MujocoRviz(self.b.model, a.rviz_rate)
             while self.b.ok() and self.state not in ("DONE", "ABORT"):
                 st = self.b.read_state()
                 if st is None:
@@ -2935,6 +2961,8 @@ class ActivePerceptionWBC:
 
                 self.st = st
                 ee_ref, base_ref, q_nom = self.update(st)
+                if self.viz is not None:
+                    self._viz_update(ee_ref)
                 if ee_ref is None and self.state in ("PRE_GRASP", "DESCEND", "GRASP", "AT_GRASP", "RETREAT", "LIFT",
                                                      "RELEASE"):
                     continue  # state just changed; next tick produces the reference
@@ -3211,6 +3239,9 @@ def main(argv=None):
     g.add_argument("--handover_time", type=float, default=5.0,
                    help="--continuous with a gripper: after the hold, open the gripper after this long [s]")
     g.add_argument("--sim_seed", type=int, default=0, help="--continuous, sim: seed of the object placements")
+    g.add_argument("--rviz", action="store_true",
+                   help="MuJoCo: publish the simulation for RViz (/tf of every body, /mujoco/scene, /mujoco/wbc)")
+    g.add_argument("--rviz_rate", type=float, default=30.0, help="--rviz: TF / marker rate [Hz]")
     g.add_argument("--dynamic", action="store_true",
                    help="moving objects: re-acquire an object that left the tracker's gate, its velocity also from "
                         "a moving camera when it clearly rolls, the camera kept on the object in PRE_GRASP (EE tilted "
