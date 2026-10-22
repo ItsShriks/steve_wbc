@@ -125,7 +125,10 @@ class RedBallDetector(Node):
                                f"{self.target.size * 100:.1f} cm {self.target.shape}")
 
         self.tf = Buffer(cache_time=Duration(seconds=10.0))
-        self.tf_listener = TransformListener(self.tf, self)
+        # TF in its own node + thread: in this node's executor the /tf callbacks (~150 Hz, queue of 100) waited
+        # behind the image processing, the buffer fell 0.4-1.8 s behind and nearly every detection was dropped
+        # for "no TF at the image time" (2026-10-22, while TF itself reached the PC with 5 ms delay)
+        self.tf_listener = TransformListener(self.tf, None, spin_thread=True)
         self.pub = self.create_publisher(PointStamped, p("target_topic", "/steve_perception/target_point").value, 10)
 
         self.cams = {}

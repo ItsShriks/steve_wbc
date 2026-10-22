@@ -125,6 +125,17 @@ def launch_setup(context: LaunchContext):
         args.append("--no_vgn")
     args += ["--vgn_mode", cfg("vgn_mode"), "--vgn_max_wait", cfg("vgn_max_wait")]
     args += ["--tool", tool, "--approach", cfg("approach")]
+    if cfg("dynamic").lower() == "true":  # moving objects (rolling ball); off: the static behaviour
+        args.append("--dynamic")
+    # wrist-camera detections closer than the depth range are wrong (the D415 on the real flange: ~0.3 m)
+    min_rng = cfg("min_detect_range") or ("0.30" if env == "real" and camera_only else "")
+    if min_rng:
+        args += ["--min_detect_range", min_rng]
+    # base <-> table legs: the real robot needs more than the 15 cm of the model — the scanners' protective
+    # field went red at 20 cm model clearance (2026-10-22: odometry drift around the table + table model error)
+    d_base = cfg("d_safe_base") or ("0.25" if env == "real" else "")
+    if d_base:
+        args += ["--d_safe_base", d_base]
     # camera looking along the flange axis (D415 on the flange): tilt it forward in the drive / scan poses
     tilt = cfg("camera_tilt") or ("25" if camera_only else "0")
     if float(tilt):
@@ -289,10 +300,20 @@ def generate_launch_description():
         DeclareLaunchArgument("detector_cameras", default_value="",
                               description="robot/Gazebo: cameras of the target detector (default: gripper_camera "
                                           "with tool camera_only, else pan_tilt_camera,wrist_camera)"),
+        DeclareLaunchArgument("dynamic", default_value="false",
+                              description="true: moving objects — camera kept on the object up to the descent, "
+                                          "re-acquire, velocity while driving (active_perception_wbc --dynamic)"),
+        DeclareLaunchArgument("min_detect_range", default_value="",
+                              description="ignore wrist-camera detections closer than this [m] (default: 0.30 with the "
+                                          "D415 of tool camera_only on the robot, else off)"),
         DeclareLaunchArgument("tool", default_value="",
                               description="what is on the flange (steve_grasping): camera_only | robotiq_2f85 | dex5 "
                                           "(default: camera_only on the robot, robotiq_2f85 in simulation); "
                                           "camera_only = go to the grasp pose only"),
+        DeclareLaunchArgument("d_safe_base", default_value="",
+                              description="min. distance base footprint <-> table legs / environment [m] (default: "
+                                          "0.25 on the robot, 0.15 in simulation); the orbit around the table and the "
+                                          "stand-off at each side grow with it"),
         DeclareLaunchArgument("approach", default_value="move",
                               description="move: plan the grasp as soon as the object is tracked and go for it without "
                                           "stopping (base + arm together) | stop: drive, stop, settle, look, reach"),

@@ -363,6 +363,12 @@ class CollisionAvoidance:
         self.s_body, self.s_pos = np.array(sb), np.array(sp)
         self.s_rad, self.s_geom = np.array(sr), np.array(sg)
         self.s_self = np.array([self.bname(b) not in self.SELF_EXCLUDED_ARM_BODIES for b in sb])
+        # spheres of the tool on the flange (steve_grasping, below `hand_mount`): a hand whose fingers wrap
+        # down to the table (tool config support_contact) may touch the support while grasping, see
+        # tool_support_contact — the flange, the wrist camera and the arm keep their margin
+        tool = subtree(body("hand_mount")) if body("hand_mount") >= 0 else set()
+        self.s_tool = np.array([b in tool for b in sb], bool)
+        self.tool_support_contact = False  # set by the grasp state machine (DESCEND / GRASP)
 
         # ── boxes: (body, centre in body frame, R in body frame, half sizes, name, moves_with_robot)
         self.boxes = []
@@ -530,6 +536,8 @@ class CollisionAvoidance:
             # the shoulder / upper arm sit on the cabinet, so they skip cabinet and base — but the
             # pan-tilt tower (0.35 m behind the shoulder) is in reach of the upper arm: all links
             mask = (np.ones(len(X), bool) if not moving or name.startswith("pan_tilt") else self.s_self)
+            if self.tool_support_contact and not moving:
+                mask = mask & ~self.s_tool
             if not mask.any():
                 continue
             L = (X[mask] - C) @ Rw
