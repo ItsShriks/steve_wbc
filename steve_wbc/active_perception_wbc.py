@@ -163,6 +163,14 @@ REACH_LEAD = 3.0              # s  reach on the move: the arm starts this long b
 ORBIT_STATES = ("PRE_GRASP", "DESCEND", "GRASP", "AT_GRASP")   # states that keep tracking the base path
 PLAN_SPAN = 0.5               # s  --approach move: object tracked this long before the grasp is planned
 APPROACH_MIN = 0.05           # m  --approach move: base this far from the grasp side's stand-off -> straight path
+MOTION_WAIT = 3.0             # s  --approach move: plan at the latest this long after --plan_span even if the
+                              #    tracker has no motion estimate yet (normally it has: static or rolling)
+MOVE_GRASP_ETA = 2.0          # s  --approach move: from the end of the base path to the grasp (arm on the move)
+# exploration (--approach move, nothing seen yet): the camera looks at the table from the launch on — its
+# centre from afar (the whole table in view), swept across it once the base is this close to the centre
+EXPLORE_NEAR = 1.4            # m
+EXPLORE_PERIOD = 8.0          # s  one sweep left-right-left (arm speed limits on the robot: 0.3 rad/s)
+CAM_STILL_W = 0.15            # rad/s camera turning slower than this: detections may fit the velocity
 # states in which the robot looks / waits instead of going for the object (--approach move avoids them)
 STOP_STATES = ("SETTLE_ARM", "COARSE_DETECT", "VGN_SCAN", "VGN_WAIT")
 
@@ -950,6 +958,7 @@ class ObjectTracker:
         self.p, self.v, self.t = None, np.zeros(3), None
         self.hist = []
         self.rejected = 0
+        self.fitted = False  # the velocity has been fitted at least once (static or moving is known)
 
     def update(self, p, t, still=True):
         """Add a detection. `still`: taken while the camera was (nearly) still. Every detection
@@ -959,7 +968,7 @@ class ObjectTracker:
         if self.t is not None and t - self.t > self.WINDOW:
             # not confirmed for a whole fit window (occluded, or the robot drove elsewhere):
             # the old estimate is stale, start a fresh track instead of gating against it
-            self.p, self.v, self.hist = None, np.zeros(3), []
+            self.p, self.v, self.hist, self.fitted = None, np.zeros(3), [], False
         if self.p is not None and np.linalg.norm(p - self.predict(t)) > self.GATE:
             self.rejected += 1
             return False
@@ -987,6 +996,7 @@ class ObjectTracker:
             elif n > self.V_MAX:
                 v *= self.V_MAX / n
             self.v = v
+            self.fitted = True
         # position: all detections, moved to time t with the current velocity (robust median)
         self.p = np.median(P - np.outer(T - t, self.v), axis=0)
         self.t = t
@@ -1381,7 +1391,26 @@ class ActivePerceptionWBC:
             return self.tracker.predict(self.t)
         if self.glimpse is not None and self.t - self.glimpse[1] < 2.0:
             return self.glimpse[0]
-        return None
+        return self._explore_point()
+
+    def _explore_point(self):
+        """--approach move, nothing seen yet (from the launch on): where the camera looks — the table top, its
+        centre from afar (the whole table in view), swept across the table once the base is within
+        EXPLORE_NEAR of the centre (the D415 sees ~0.8 m of it at 1 m)."""
+        rect = self.w.support_rect()
+        if rect is None or self.a.approach != "move" or self.state not in ("DRIVE", "REPOSITION") or self.placed:
+            return None
+        lo, hi = np.asarray(rect[0], float), np.asarray(rect[1], float)
+        top = self.w.support_top_z()
+        c = 0.5 * (lo + hi)
+        d = c - self.st.base[:2]
+        dist = float(np.linalg.norm(d))
+        p = np.array([c[0], c[1], top if top is not None else 0.8])
+        if 1e-6 < dist < EXPLORE_NEAR:
+            across = np.array([-d[1], d[0]]) / dist
+            half = max(0.5 * float(np.abs(across) @ (hi - lo)) - 0.10, 0.0)
+            p[:2] += across * half * np.sin(2.0 * np.pi * self.t / EXPLORE_PERIOD)
+        return p
 
     def _camera_ready(self, still_for=None):
         """Visibility task on: camera on the object (< VIS_READY_DEG) and, with still_for, the arm
@@ -1432,8 +1461,12 @@ class ActivePerceptionWBC:
 
     def _plan_ready(self):
         """--approach move: plan the grasp now (while driving) — object tracked for --plan_span, table known."""
-        return (self.a.approach == "move" and not self.placed and not self.watching and self._can_plan()
-                and self._tracked() and self.t - self.tracker.hist[0][0] >= self.a.plan_span)
+        if not (self.a.approach == "move" and not self.placed and not self.watching and self._can_plan()
+                and self._tracked()):
+            return False
+        span = self.t - self.tracker.hist[0][0]
+        # the side is chosen from where the object WILL be: wait until static / rolling is known
+        return span >= self.a.plan_span and (self.tracker.fitted or span >= self.a.plan_span + MOTION_WAIT)
 
     def _base_speed_along(self, direction):
         """Current base speed (last command, world frame) along a world xy direction (>= 0)."""
@@ -1505,6 +1538,10 @@ class ActivePerceptionWBC:
         # the viewpoint bias changes when the arm swings the camera, hardly when the base
         # translates it (e.g. while driving up to the table)
         still = np.max(np.abs(self.u_prev[3:])) < TRACK_STILL_DQ
+        if not still and self.cam_ok and self.a.approach == "move":
+            # the visibility task keeps the camera on the object while the base drives: the joints move,
+            # the view hardly turns -> no swing bias, the detection may fit the velocity
+            still = float(np.linalg.norm(self.kin.camera(self.st.base[2])[3] @ self.u_prev)) < CAM_STILL_W
         if self.tracker.update(p, self.t, still):
             self.last_seen = self.t
             self.n_seen[cam] = self.n_seen.get(cam, 0) + 1
@@ -1546,7 +1583,8 @@ class ActivePerceptionWBC:
                 if self.state != "DRIVE":
                     return None, BaseReference(st.base.copy(), np.array([speed * np.cos(yaw), speed * np.sin(yaw), 0.0])), \
                         DRIVE_POSE
-            if speed > 0.0 and front <= a.d_safe_base + LIDAR_SLOW_MARGIN and self._reach_from_drive(st):
+            if (speed > 0.0 and front <= a.d_safe_base + LIDAR_SLOW_MARGIN
+                    and (a.approach == "stop" or not self._can_plan()) and self._reach_from_drive(st)):
                 # reach on the move: plan the grasp while still rolling up to the table, no stop + settle;
                 # PRE_GRASP leaves the base to the QP (it brakes within its acceleration limit)
                 self.base_hold = st.base.copy()
@@ -1561,6 +1599,13 @@ class ActivePerceptionWBC:
                 self._begin_grasp_planning(st, f"LiDAR {front:.3f} m | object tracked since t={self.tracker.hist[0][0]:.1f} s")
                 if self.state != "DRIVE":
                     return None, BaseReference(st.base.copy(), np.zeros(3)), DRIVE_POSE
+            if ((speed == 0.0 or travelled >= a.max_drive) and front >= a.d_safe_base - LIDAR_EMERGENCY_MARGIN
+                    and a.approach == "move" and not self.placed and not self._tracked() and self._can_plan()):
+                # --approach move: the camera explored the table on the way and saw nothing -> no stop-and-sweep,
+                # drive on around the table to the next side, exploring
+                self.base_hold = st.base.copy()
+                if self._search_next_side(st):
+                    return None, self.base_path.at(0.0)[0], DRIVE_POSE
             if speed == 0.0 or travelled >= a.max_drive:
                 self.base_hold, self.backup_start = st.base.copy(), st.base.copy()
                 why = f"LiDAR {front:.3f} m" if front <= stop_d else f"travelled {travelled:.2f} m"
@@ -1604,6 +1649,12 @@ class ActivePerceptionWBC:
                 self._begin_grasp_planning(st, f"object moving ({np.linalg.norm(self.tracker.v) * 100:.1f} cm/s) -> "
                                                "re-planning the approach to intercept it")
                 return None, BaseReference(st.base.copy(), np.zeros(3)), DRIVE_POSE
+            if move and not self.placed and self._plan_ready():
+                # found while driving around the table (searching): plan from here, on the move
+                self.base_path = []
+                self._begin_grasp_planning(st, f"object found while driving to the {self.side} side")
+                return None, (self.base_path.at(0.0)[0] if self.base_path else
+                              BaseReference(st.base.copy(), np.zeros(3))), DRIVE_POSE
             q_move = self._drive_vgn_views(st) if move and a.vgn_mode == "drive" else DRIVE_POSE
             if move and self.placed and ts >= self.base_path.T - a.reach_lead:
                 self._vgn_kick()
@@ -1617,6 +1668,12 @@ class ActivePerceptionWBC:
                     return None, ref, DRIVE_POSE
             if done and err < 0.02 and abs(wrap_angle(ref.pose[2] - st.base[2])) < 0.03:
                 self.base_hold, self.base_path = ref.pose.copy(), []
+                if move and not self.placed and not self._tracked() and not self.watching:
+                    # searching on the move: nothing from this side either -> the next one, or give up
+                    if self._search_next_side(st):
+                        return None, self.base_path.at(0.0)[0], DRIVE_POSE
+                    self._end_episode(f"object not found from the {', '.join(self.searched)} side(s)", failed=True)
+                    return None, BaseReference(self.base_hold, np.zeros(3)), DRIVE_POSE
                 self._enter("SETTLE_ARM", f"at the {self.side} side")
                 return None, BaseReference(self.base_hold, np.zeros(3)), DRIVE_POSE
             if ts > self.base_path.T + 30.0:
@@ -2344,13 +2401,17 @@ class ActivePerceptionWBC:
               + ("moving: intercept from here if reachable" if moving
                  else f"grasp from here ({here})" if preferred == here else f"grasp from the {preferred} side"))
         cands = []
+        move = self.a.approach == "move"
         for name, (n, yaw) in SIDES.items():
             if name in self.bad_sides:
                 continue
-            # where the object will be when the grasp from this side can start
-            eta = GRASP_ETA
+            # where the object will be when the grasp from this side can start (--approach move: the base
+            # path's duration + the reach on the move; a rolling object is predicted along its path)
+            eta = MOVE_GRASP_ETA if move else GRASP_ETA
             if name != here:
                 eta += self._ring_path(st.base, np.array([*obj[:2], yaw]), lo, hi)[1] / self._orbit_v()
+            elif move:
+                eta += float(np.linalg.norm(obj[:2] - st.base[:2])) / max(min(self.a.drive_speed, self.a.max_base_v), 1e-3)
             o = self.tracker.predict(self.t + eta)
             xy = np.clip(o[:2], lo, hi)
             xy = np.where(n != 0, np.where(n > 0, hi, lo) + n * standoff, xy)
