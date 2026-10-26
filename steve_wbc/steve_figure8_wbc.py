@@ -1476,6 +1476,12 @@ class RosBackend(Backend):
 
     def read_state(self):
         self._spin()
+        # after a long blocking call (approach planning, 0.4-0.9 s) the 10 callbacks drained by _spin are
+        # mostly old queued messages: wait up to state_timeout for fresh ones before calling the state stale
+        # (3 of 13 real runs on 2026-10-26 aborted with "/joint_states stale (0.5 s)" right after a planning)
+        t_end = time.monotonic() + self.args.state_timeout
+        while self.rclpy.ok() and time.monotonic() < t_end and self._stale(time.monotonic()):
+            self.rclpy.spin_once(self.node, timeout_sec=0.01)
         now = time.monotonic()
         if now - self.q_stamp > self.args.state_timeout:
             self.log.error(f"/joint_states stale ({now - self.q_stamp:.2f}s)")
@@ -1484,6 +1490,10 @@ class RosBackend(Backend):
             self.log.error(f"odom stale ({now - self.base_stamp:.2f}s)")
             return None
         return RobotState(self.base.copy(), self.q.copy())
+
+    def _stale(self, now):
+        return (now - self.q_stamp > self.args.state_timeout
+                or (self.args.base_feedback == "odom" and now - self.base_stamp > self.args.state_timeout))
 
     def send(self, u, filtered=True):
         tw = self.Twist()

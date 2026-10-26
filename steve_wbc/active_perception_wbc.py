@@ -117,6 +117,7 @@ LIDAR_SLOW_MARGIN = 0.30      # m  above d_safe_base -> slow speed
 LIDAR_STOP_MARGIN = 0.05      # m  above d_safe_base -> stop (braking room)
 LIDAR_EMERGENCY_MARGIN = 0.05 # m  below d_safe_base -> back up
 SLOW_SPEED, BACKUP_SPEED = 0.10, 0.08
+ARRIVE_TOL = 0.08              # m  base this close to the side's stand-off: arrived at the table (DRIVE)
 
 # ── Grasping ─────────────────────────────────────────────────────────────────
 PREGRASP_HEIGHT = 0.10        # m above the object
@@ -1808,6 +1809,14 @@ class ActivePerceptionWBC:
             speed = (a.drive_speed if front > a.d_safe_base + LIDAR_SLOW_MARGIN
                      else SLOW_SPEED if front > stop_d else 0.0)
             travelled = np.linalg.norm(st.base[:2] - self.drive_start[:2])
+            at_table = speed == 0.0 or travelled >= a.max_drive
+            squared_up = False
+            if not at_table and a.approach == "move" and self._can_plan() and front <= a.d_safe_base + LIDAR_SLOW_MARGIN:
+                # squared up at the side's stand-off with the LiDAR still in the slow band (stand-off beyond the
+                # stop distance): _table_align does not drive on -> at the table. Without this the robot waited
+                # in DRIVE until the object was tracked again (real run 2026-10-26 13:57: 16 s, LiDAR 0.28 m)
+                squared_up = np.linalg.norm(self._side_goal(self._side_of(st.base))[:2] - st.base[:2]) <= ARRIVE_TOL
+                at_table = squared_up
             if self._plan_ready() and front >= a.d_safe_base - LIDAR_EMERGENCY_MARGIN:
                 # --approach move: the object is tracked -> plan the grasp now, while driving: the base
                 # goes on to the grasp side's stand-off (straight, or around the table) without stopping
@@ -1826,7 +1835,7 @@ class ActivePerceptionWBC:
                                                f"t={self.tracker.hist[0][0]:.1f} s")
                 if self.state != "DRIVE":
                     return None, BaseReference(st.base.copy(), np.zeros(3)), DRIVE_POSE
-            if (speed == 0.0 or travelled >= a.max_drive) and front >= a.d_safe_base - LIDAR_EMERGENCY_MARGIN \
+            if at_table and front >= a.d_safe_base - LIDAR_EMERGENCY_MARGIN \
                     and a.approach == "move" and not self.placed and self._can_plan() and self._known():
                 # --approach move: at the table before --plan_span was reached: plan now instead of settling
                 self.base_hold = st.base.copy()
@@ -1834,7 +1843,7 @@ class ActivePerceptionWBC:
                                                f"{self.t - self.last_seen:.1f} s ago")
                 if self.state != "DRIVE":
                     return None, BaseReference(st.base.copy(), np.zeros(3)), DRIVE_POSE
-            if ((speed == 0.0 or travelled >= a.max_drive) and front >= a.d_safe_base - LIDAR_EMERGENCY_MARGIN
+            if (at_table and front >= a.d_safe_base - LIDAR_EMERGENCY_MARGIN
                     and a.approach == "move" and not self.placed and not self._known() and self._can_plan()):
                 # --approach move: the camera explored the table on the way and saw nothing -> no stop-and-sweep,
                 # drive on around the table to the next side, exploring
@@ -1844,9 +1853,9 @@ class ActivePerceptionWBC:
                     return None, BaseReference(self.base_hold, np.zeros(3)), self.explore_q
                 if self._search_next_side(st):
                     return None, self.base_path.at(0.0)[0], DRIVE_POSE
-            if speed == 0.0 or travelled >= a.max_drive:
+            if at_table:
                 self.base_hold, self.backup_start = st.base.copy(), st.base.copy()
-                why = f"LiDAR {front:.3f} m" if front <= stop_d else f"travelled {travelled:.2f} m"
+                why = (f"LiDAR {front:.3f} m" if front <= stop_d or squared_up else f"travelled {travelled:.2f} m")
                 self._enter("BACKUP" if front < a.d_safe_base - LIDAR_EMERGENCY_MARGIN else "SETTLE_ARM",
                             why + (f" | object tracked since t={self.tracker.hist[0][0]:.1f} s"
                                    if self.tracker.hist else " | object not seen yet"))
@@ -2439,7 +2448,7 @@ class ActivePerceptionWBC:
         """drive mode: arm posture while driving, taking VGN views once the object is near. `idle`: the
         posture while not (yet) taking views (--approach move: the explore pose)."""
         idle = DRIVE_POSE if idle is None else idle
-        if not self._tracked():
+        if getattr(self.w, "vgn", None) is None or not self._tracked():  # --no_vgn: no grasp detector
             return idle
         obj = self.tracker.predict(self.t)
         if np.linalg.norm(obj[:2] - st.base[:2]) > self.a.vgn_drive_range:
