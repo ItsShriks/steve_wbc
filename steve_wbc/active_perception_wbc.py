@@ -1464,6 +1464,55 @@ class ActivePerceptionWBC:
         c = self.kin.camera(pose[2])[0]
         return self.hmap.line_of_sight(c, obj, self.w.target.radius), c
 
+    # ── the table's own frame: centre + yaw from the table model (table_probe); a measured table is rotated
+    # in odom (2026-10-26: -64 deg) — sides, quadrants, orbit and the squaring-up are planned in its frame,
+    # not on its axis-aligned bounding box (whose "sides" are not the table's edges) ──
+    def _tframe(self):
+        if getattr(self, "_tf_cache", None) is None:
+            tm = getattr(self.w, "table", None)
+            if tm is not None:
+                c, psi, half = np.asarray(tm.center, float), float(tm.yaw), 0.5 * np.asarray(tm.size, float)
+            else:
+                lo, hi = self.w.support_rect()
+                c, psi, half = 0.5 * (np.asarray(lo) + np.asarray(hi)), 0.0, 0.5 * (np.asarray(hi) - np.asarray(lo))
+            self._tf_cache = (c, psi, half)
+        return self._tf_cache
+
+    def _rect_t(self):
+        """(lo, hi) of the table top in its own frame (centred)."""
+        h = self._tframe()[2]
+        return -h, h
+
+    def _to_t(self, xy):
+        """odom xy (or Nx2) -> table frame."""
+        c, psi, _ = self._tframe()
+        return (np.asarray(xy, float)[..., :2] - c) @ rot_z(psi)[:2, :2]
+
+    def _to_w(self, xy):
+        """table frame xy (or Nx2) -> odom."""
+        c, psi, _ = self._tframe()
+        return np.asarray(xy, float) @ rot_z(psi)[:2, :2].T + c
+
+    def _pose_t(self, pose):
+        return np.array([*self._to_t(pose[:2]), wrap_angle(pose[2] - self._tframe()[1])])
+
+    def _side_goal(self, name, xy_t=None):
+        """Base pose (odom) at the stand-off of table side `name`, facing the table; xy_t: point (table frame)
+        to align with along the side (default its middle)."""
+        lo, hi = self._rect_t()
+        n, yaw = SIDES[name]
+        xy = np.zeros(2) if xy_t is None else np.clip(np.asarray(xy_t, float), lo, hi)
+        xy = np.where(n != 0, np.where(n > 0, hi, lo) + n * self._standoff(), xy)
+        return np.array([*self._to_w(xy), yaw + self._tframe()[1]])
+
+    def _orbit_w(self, start, goal, o):
+        """TableOrbit around the real (rotated) table, planned in its frame, returned in odom."""
+        lo, hi = self._rect_t()
+        path = TableOrbit(lo, hi, o).path(self._pose_t(start), self._pose_t(goal), self._orbit_v())
+        path.pts = self._to_w(path.pts)
+        path.yaw = np.asarray(path.yaw) + self._tframe()[1]
+        return path
+
     def _standoff(self):
         return self.a.d_safe_base + BASE_LAG_BUFFER + STANDOFF_MARGIN + self.ctrl.coll.base_xy_max[0]
 
@@ -1476,20 +1525,16 @@ class ActivePerceptionWBC:
         here = self._side_of(st.base, lo, hi)
         if here not in self.searched:
             self.searched.append(here)
-        best, centre = None, 0.5 * (lo + hi)
+        best = None
         for name in [s for s in SIDES if s not in self.searched]:
-            n, yaw = SIDES[name]
-            xy = np.where(n != 0, np.where(n > 0, hi, lo) + n * self._standoff(), centre)
-            goal = np.array([xy[0], xy[1], yaw])
+            goal = self._side_goal(name)
             path, length = self._ring_path(st.base, goal, lo, hi)
             if best is None or length < best[0]:
                 best = (length, name, path)
         if best is None:
             return False
         length, name, path = best
-        n_, yaw_ = SIDES[name]
-        xy_ = np.where(n_ != 0, np.where(n_ > 0, hi, lo) + n_ * self._standoff(), centre)
-        path = self._safe_ring_path(st.base, np.array([xy_[0], xy_[1], yaw_]), lo, hi)
+        path = self._safe_ring_path(st.base, self._side_goal(name), lo, hi)
         length = path.length
         self.side, self.base_path = name, path
         self._enter("REPOSITION", f"object not found from the {here} side"
@@ -1570,7 +1615,8 @@ class ActivePerceptionWBC:
         p = np.array([c[0], c[1], top if top is not None else 0.8])
         if 1e-6 < dist < EXPLORE_NEAR:
             across = np.array([-d[1], d[0]]) / dist
-            half = max(0.5 * float(np.abs(across) @ (hi - lo)) - 0.10, 0.0)
+            across_t = across @ rot_z(self._tframe()[1])[:2, :2]  # in the table frame
+            half = max(float(np.abs(across_t) @ self._tframe()[2]) - 0.10, 0.0)
             p[:2] += across * half * np.sin(2.0 * np.pi * self.t / EXPLORE_PERIOD)
         return p
 
@@ -1618,7 +1664,8 @@ class ActivePerceptionWBC:
             return True
         lo, hi = self.w.support_rect()
         here = self._side_of(st.base, lo, hi)
-        _, preferred = table_quadrant(self.tracker.predict(self.t)[:2], lo, hi, self.arrival_side or here)
+        _, preferred = table_quadrant(self._to_t(self.tracker.predict(self.t)[:2]), *self._rect_t(),
+                                      self.arrival_side or here)
         return preferred == here
 
     def _known(self):
@@ -1818,6 +1865,11 @@ class ActivePerceptionWBC:
             backed = np.linalg.norm(st.base[:2] - self.backup_start[:2])
             if front >= a.d_safe_base + LIDAR_STOP_MARGIN or backed > 0.5:
                 self.base_hold = st.base.copy()
+                if a.approach == "move" and self._can_plan() and not self.placed:
+                    # continuous: back to the table logic (plan if the object is known, else explore the table
+                    # with the camera and search the next side on the move) — no settle / sweep
+                    self._enter("DRIVE", f"clearance {front * 100:.0f} cm restored -> exploring on")
+                    return None, BaseReference(self.base_hold, np.zeros(3)), self.explore_q
                 self._enter("SETTLE_ARM", f"clearance {front * 100:.0f} cm restored" if front >= a.d_safe_base
                             + LIDAR_STOP_MARGIN else f"[WARN] backed up {backed:.2f} m, clearance still only "
                                                      f"{front * 100:.0f} cm (< {a.d_safe_base * 100:.0f} cm)")
@@ -1896,9 +1948,10 @@ class ActivePerceptionWBC:
 
         if self.state == "COARSE_DETECT":
             cfg = PerceptionConfig()
-            if self.pan_cmd <= cfg.scan_start:
+            lo_p, hi_p = self._table_pan_range(st, cfg)
+            if self.pan_cmd <= lo_p:
                 self.pan_dir = 1.0
-            elif self.pan_cmd >= cfg.scan_end:
+            elif self.pan_cmd >= hi_p:
                 self.pan_dir = -1.0
             if self.glimpse is not None and t - self.glimpse[1] < 2.0:
                 # seen while sweeping: stop and look there, still detections feed the tracker
@@ -2621,8 +2674,10 @@ class ActivePerceptionWBC:
             pts.append(np.array([obj[0], obj[1], top + TRANSIT_CLEARANCE]))
         return pts
 
-    def _side_of(self, base, lo, hi):
-        x, y = base[:2]
+    def _side_of(self, base, lo=None, hi=None):
+        """Table side the base is at (in the table's own frame; lo / hi ignored)."""
+        x, y = self._to_t(base[:2])
+        lo, hi = self._rect_t()
         gaps = {"front": lo[0] - x, "back": x - hi[0], "right": lo[1] - y, "left": y - hi[1]}
         return max(gaps, key=gaps.get)
 
@@ -2637,20 +2692,32 @@ class ActivePerceptionWBC:
     def _ring_path(self, start, goal, lo, hi):
         """Smooth orbit start -> goal around the table (TableOrbit), the shorter way round:
         (OrbitPath, length [m])."""
-        _, o = self._ring(lo, hi)
-        path = TableOrbit(lo, hi, o).path(np.asarray(start, float), np.asarray(goal, float), self._orbit_v())
+        _, o = self._ring(*self._rect_t())
+        path = self._orbit_w(start, goal, o)
         if self.a.approach == "move" and len(path.pts) > 1:  # still driving: ramp from the current speed
             path = OrbitPath(path.pts, path.yaw, self._orbit_v(), v0=self._base_speed_along(path.pts[1] - path.pts[0]))
         return path, path.length
 
+    def _table_pan_range(self, st, cfg):
+        """Shoulder-pan range of a search sweep: only over the table (its corners as seen from the shoulder,
+        + 0.1 rad) when it is known, else the fixed range of PerceptionConfig."""
+        rect = self.w.support_rect()
+        if rect is None:
+            return cfg.scan_start, cfg.scan_end
+        lo, hi = self._rect_t()
+        top = self.w.support_top_z() or 0.8
+        ref = st.q[0]
+        corners = self._to_w(np.array([[x, y] for x in (lo[0], hi[0]) for y in (lo[1], hi[1])]))
+        pans = [ref + wrap_angle(self._pan_to(st, np.array([cx, cy, top])) - ref) for cx, cy in corners]
+        return min(pans) - 0.1, max(pans) + 0.1
+
     def _table_align(self, st, speed):
         """--approach move, driving up to the table: face the nearest side squarely (the measured table's own
         yaw included) and head for the middle of that side at the stand-off, at the LiDAR-regulated `speed`."""
-        lo, hi = self.w.support_rect()
-        here = self._side_of(st.base, lo, hi)
+        here = self._side_of(st.base)
         n, yaw_side = SIDES[here]
-        tyaw = float(getattr(getattr(self.w, "table", None), "yaw", 0.0) or 0.0)
-        goal = np.where(n != 0, np.where(n > 0, hi, lo) + n * self._standoff(), 0.5 * (lo + hi))
+        tyaw = self._tframe()[1]
+        goal = self._side_goal(here)[:2]
         d = goal - st.base[:2]
         dist = float(np.linalg.norm(d))
         v = speed * d / dist if dist > 0.05 else np.zeros(2)
@@ -2752,9 +2819,9 @@ class ActivePerceptionWBC:
         yaw) of the path keeps d_safe_base (+ lag buffer) from the legs / skirt; if not, the ring is moved
         out by the shortfall and the path planned again. Returns the path (min_clearance set)."""
         need = self.a.d_safe_base + BASE_LAG_BUFFER
-        _, o = self._ring(lo, hi)
+        _, o = self._ring(*self._rect_t())
         for it in range(5):
-            path = TableOrbit(lo, hi, o).path(np.asarray(start, float), np.asarray(goal, float), self._orbit_v())
+            path = self._orbit_w(start, goal, o)
             clr, where = self._path_clearance(path, skip_from=start)
             if clr >= need or it == 4:
                 break
@@ -2780,7 +2847,7 @@ class ActivePerceptionWBC:
         here = self._side_of(st.base, lo, hi)
         if self.arrival_side is None:
             self.arrival_side = here   # quadrants stay fixed to the side the robot came from
-        quad, preferred = table_quadrant(obj[:2], lo, hi, self.arrival_side)
+        quad, preferred = table_quadrant(self._to_t(obj[:2]), *self._rect_t(), self.arrival_side)
         moving = bool(np.any(self.tracker.v))
         self.plan_moving, self.plan_here = moving, here
         if moving:  # it rolls on while the robot drives around: intercept from here if reachable
@@ -2797,19 +2864,19 @@ class ActivePerceptionWBC:
             # path's duration + the reach on the move; a rolling object is predicted along its path)
             eta = MOVE_GRASP_ETA if move else GRASP_ETA
             if name != here:
-                eta += self._ring_path(st.base, np.array([*obj[:2], yaw]), lo, hi)[1] / self._orbit_v()
+                eta += self._ring_path(st.base, np.array([*obj[:2], yaw + self._tframe()[1]]), lo, hi)[1] / self._orbit_v()
             elif move:
                 eta += float(np.linalg.norm(obj[:2] - st.base[:2])) / max(min(self.a.drive_speed, self.a.max_base_v), 1e-3)
             o = self.tracker.predict(self.t + eta)
-            xy = np.clip(o[:2], lo, hi)
-            xy = np.where(n != 0, np.where(n > 0, hi, lo) + n * standoff, xy)
+            side_pose = self._side_goal(name, self._to_t(o[:2]))  # stand-off in front of the object (table frame)
+            xy = side_pose[:2]
             if name == here:  # the QP moves the base to the stand-off itself; keep the heading
                 goal, path, length = np.array([xy[0], xy[1], st.base[2]]), [], 0.0
                 if self.a.approach == "move" and np.linalg.norm(goal[:2] - st.base[:2]) > APPROACH_MIN:
                     # still driving up: straight on to the stand-off as a base path (cost 0: this side first)
                     path = self._line_path(st.base, goal)
             else:
-                goal = np.array([xy[0], xy[1], yaw])
+                goal = side_pose
                 path, length = self._ring_path(st.base, goal, lo, hi)
             cands.append((length, name, goal, path, o))
         los, cams = {}, []
@@ -2834,7 +2901,8 @@ class ActivePerceptionWBC:
             # a rolling object predicted (nearly) off the table cannot be grasped there; a static one lies where
             # it was seen resting on the table — also right at the edge of a measured (LiDAR, legs) table model,
             # which can be a few cm smaller than the real top (2026-10-22: ball 0.9 cm inside the model's edge)
-            if moving and (np.any(o[:2] < lo + 0.03) or np.any(o[:2] > hi - 0.03)):
+            o_t, (lo_t, hi_t) = self._to_t(o[:2]), self._rect_t()
+            if moving and (np.any(o_t < lo_t + 0.03) or np.any(o_t > hi_t - 0.03)):
                 report.append(f"{name}: object off the table by then")
                 continue
             for yaw in GRASP_YAWS:  # rotate the grasp so the open fingers clear the obstacles
