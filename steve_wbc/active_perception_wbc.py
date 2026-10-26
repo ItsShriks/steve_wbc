@@ -2886,11 +2886,13 @@ class ActivePerceptionWBC:
         # time base AND arm stood still before the grasp descent (--approach move: should be ~0; a VGN
         # hover at the pre-grasp moves with the object, so it only counts for a static one)
         self.still_before_grasp, self.t_reach = 0.0, None
-        # explore pose (--approach move + table): the arm raised, the (tilted) camera forward-down over the table;
+        # explore pose (--approach move + table): home, the (tilted) camera forward-down over the table;
         # from ANY start pose (drive pose, "parked", ...) the arm goes there first — no camera aiming meanwhile
         # (a folded, wrist-singular arm only chattered against it) — then the camera explores the table
         move_explore = a.approach == "move" and self._can_plan()
-        self.explore_q = list(SCAN_SEED_Q) if move_explore else list(DRIVE_POSE)
+        # = the named state "explore" (steve_manipulation SRDF): home with the camera tilted at the table
+        # (--camera_tilt, 25 deg with the D415 on the flange); the visibility task then aims it
+        self.explore_q = list(DRIVE_POSE)
         off = float(np.max(np.abs(wrap_angle(st.q - np.asarray(self.explore_q)))))
         self.unparking = off > (UNPARK_TOL[1] if move_explore else UNPARK_TOL[0])
         if self.unparking:
