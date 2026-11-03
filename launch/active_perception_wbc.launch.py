@@ -26,6 +26,7 @@ Perception (robot / Gazebo):
     detector:=gsam         Grounded SAM with gsam_prompt (steve_perception gsam_target_detector)
     grasp_backend:=vgn     VGN on the TSDF of the scan views (default)
     grasp_backend:=cgn     Contact-GraspNet per view on the target's Grounded-SAM mask
+    grasp_backend:=dgn2    DexGraspNet 2.0 per view, retargeted to the hand (tool:=ability_hand)
 gsam / cgn need the model servers (steve_perception/model_server/README.md); this launch file
 starts them (model_servers:=auto), or keep them running in another terminal (model_servers:=false):
     ros2 run steve_perception model_server gsam
@@ -189,8 +190,10 @@ def launch_setup(context: LaunchContext):
     if detector not in ("hsv", "gsam", "false"):
         raise RuntimeError(f"detector must be hsv, gsam or false, got '{cfg('detector')}'")
     backend = cfg("grasp_backend").lower()
-    if backend not in ("vgn", "cgn"):
-        raise RuntimeError(f"grasp_backend must be vgn or cgn, got '{cfg('grasp_backend')}'")
+    if backend not in ("vgn", "cgn", "dgn2"):
+        raise RuntimeError(f"grasp_backend must be vgn, cgn or dgn2, got '{cfg('grasp_backend')}'")
+    if backend == "dgn2":
+        args += ["--grasp_backend", "dgn2"]
     if backend == "cgn":
         if env == "mujoco":
             raise RuntimeError("grasp_backend:=cgn needs real camera views (robot / Gazebo); MuJoCo uses VGN")
@@ -209,6 +212,7 @@ def launch_setup(context: LaunchContext):
     if env != "mujoco" and cfg("model_servers").lower() != "false":
         servers += ["gsam"] if detector == "gsam" or (backend == "cgn" and cfg("vgn").lower() == "true") else []
         servers += ["cgn"] if backend == "cgn" and cfg("vgn").lower() == "true" else []
+        servers += ["dgn2"] if backend == "dgn2" and cfg("vgn").lower() == "true" else []
     if env == "real" and tool == "ability_hand" and cfg("launch_hand").lower() == "true":
         # the Ability Hand: ah_node (serial) + the GripperCommand bridge the WBC closes / opens it through
         actions.append(IncludeLaunchDescription(
@@ -357,7 +361,8 @@ def generate_launch_description():
                               description="detector:=gsam / grasp_backend:=cgn: text naming the target"),
         DeclareLaunchArgument("grasp_backend", default_value="vgn",
                               description="grasp scan (vgn:=true): vgn (TSDF of the views) | cgn (robot / Gazebo: "
-                                          "Contact-GraspNet per view on the target's Grounded-SAM mask)"),
+                                          "Contact-GraspNet per view on the target's Grounded-SAM mask) | dgn2 "
+                                          "(DexGraspNet 2.0, retargeted to the hand)"),
         DeclareLaunchArgument("model_servers", default_value="auto",
                               description="auto: start the GPU model servers detector:=gsam / grasp_backend:=cgn "
                                           "need | false: already running (ros2 run steve_perception model_server ...)"),

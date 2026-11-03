@@ -536,7 +536,9 @@ class CollisionAvoidance:
             # the shoulder / upper arm sit on the cabinet, so they skip cabinet and base — but the
             # pan-tilt tower (0.35 m behind the shoulder) is in reach of the upper arm: all links
             mask = (np.ones(len(X), bool) if not moving or name.startswith("pan_tilt") else self.s_self)
-            if self.tool_support_contact and not moving:
+            if self.tool_support_contact and not moving and not name.startswith("obst_"):
+                # the support (table) only: obstacles keep their margin from the hand too — ignored, the fingers
+                # wrapping a ball next to a bottle went 3.8 cm into it and the lift stuck at the margin (sim, 2026-10-26)
                 mask = mask & ~self.s_tool
             if not mask.any():
                 continue

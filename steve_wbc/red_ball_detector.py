@@ -35,7 +35,7 @@ from message_filters import ApproximateTimeSynchronizer, Subscriber
 from rclpy.duration import Duration
 from rclpy.node import Node
 from rclpy.time import Time
-from sensor_msgs.msg import CameraInfo, Image
+from sensor_msgs.msg import CameraInfo, Image, PointCloud2
 from tf2_ros import Buffer, TransformException, TransformListener
 from trajectory_msgs.msg import JointTrajectory, JointTrajectoryPoint
 
@@ -130,6 +130,11 @@ class RedBallDetector(Node):
         # for "no TF at the image time" (2026-10-22, while TF itself reached the PC with 5 ms delay)
         self.tf_listener = TransformListener(self.tf, None, spin_thread=True)
         self.pub = self.create_publisher(PointStamped, p("target_topic", "/steve_perception/target_point").value, 10)
+        # the object's depth points (target_frame) of every detection: active_perception_wbc's shape-based grasp
+        # (fits a sphere / cylinder / box to them); '' = off
+        cloud_topic = p("target_cloud_topic", "/steve_perception/target_cloud").value
+        self.cloud_pub = self.create_publisher(PointCloud2, cloud_topic, 10) if cloud_topic else None
+        self.cloud_max = p("target_cloud_max_points", 600).value
 
         self.cams = {}
         for name in cameras:
@@ -245,7 +250,8 @@ class RedBallDetector(Node):
         pts = np.stack([(xs[ok] - K[0, 2]) * zz[ok] / K[0, 0], (ys[ok] - K[1, 2]) * zz[ok] / K[1, 1], zz[ok]], 1)
         if c["conv"] == "x_forward":
             pts = pts @ R_OPT_TO_XFWD.T
-        top = self.target.center_from_points(pts @ R.T + tr)
+        pts_w = pts @ R.T + tr
+        top = self.target.center_from_points(pts_w)
         if top is not None:
             p = top
         c_sph = None
@@ -263,6 +269,24 @@ class RedBallDetector(Node):
         out.header.frame_id = self.target_frame
         out.point.x, out.point.y, out.point.z = (float(v) for v in p)
         self.pub.publish(out)
+        if self.cloud_pub is not None:
+            # for the shape fit: the blob without its rim (flying pixels mix ball and background depth, as in
+            # sphere_center), nothing far behind the nearest point
+            import cv2
+            core = cv2.erode(mask.astype(np.uint8), np.ones((7, 7), np.uint8)) > 0
+            cy_, cx_ = np.nonzero(core)
+            zc = depth[cy_, cx_]
+            okc = np.isfinite(zc) & (zc > self.min_range) & (zc < self.max_range)
+            if okc.sum() >= 30:
+                zc = zc[okc]
+                Pc = np.stack([(cx_[okc] - K[0, 2]) * zc / K[0, 0], (cy_[okc] - K[1, 2]) * zc / K[1, 1], zc], 1)
+                Pc = Pc[zc < np.percentile(zc, 5) + 0.12]
+                if c["conv"] == "x_forward":
+                    Pc = Pc @ R_OPT_TO_XFWD.T
+                Pc = Pc @ R.T + tr
+                from sensor_msgs_py import point_cloud2
+                step = max(1, len(Pc) // self.cloud_max)
+                self.cloud_pub.publish(point_cloud2.create_cloud_xyz32(out.header, Pc[::step].astype(np.float32)))
         c["n"] += 1
 
 

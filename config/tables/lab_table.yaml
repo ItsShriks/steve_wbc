@@ -2,9 +2,9 @@
 name: lab_table
 frame: odom
 center:
-- 1.2266
-- -0.598
-yaw: -1.1188
+- 1.4105
+- -0.178
+yaw: -0.134
 size:
 - 0.8652
 - 0.8394
@@ -27,4 +27,4 @@ legs:
   - -0.0033
   - 0.025
 skirt: 0.0
-notes: 'table_probe --lidar_only 2026-10-26 13:40: top_z 0.827'
+notes: 'table_probe --lidar_only 2026-10-26 14:13: top_z 0.827'
