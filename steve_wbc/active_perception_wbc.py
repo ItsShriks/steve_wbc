@@ -2440,7 +2440,7 @@ class ActivePerceptionWBC:
                 elif ts >= max(a.hold_time, 0.5):
                     a.d_safe = self.d_safe
                     self._enter("RETREAT", f"margin -> {self.d_safe * 100:.1f} cm, back up to the pre-grasp height")
-            elif ts >= GRASP_TIME:
+            elif ts >= GRASP_TIME and self._hand_settled(ts):
                 a.d_safe = self.d_safe
                 fb = self._touch("closed")
                 missed = a.touch_check == "act" and fb is not None and fb.state == "empty"
@@ -3092,6 +3092,21 @@ class ActivePerceptionWBC:
               + f", approach {np.degrees(min(tilt, max_tilt)):.0f} deg from vertical"
               + (f" (DexGraspNet {np.degrees(tilt):.0f} deg, capped)" if tilt > max_tilt else "")
               + (f" | {meta}" if meta is not None else ""))
+
+    def _hand_settled(self, ts):
+        """GRASP on the robot: the real hand (over the network) closes slower than GRASP_TIME — lift once its touch
+        check has settled on the close command (held / blocked / empty), at the latest after --grasp_wait.
+        Simulation / no gripper: GRASP_TIME alone, as before."""
+        if self.a.mode != "ros" or not self.a.tool_spec.gripper:
+            return True
+        fb = self.w.grasp_feedback()
+        if fb is not None and fb.cmd_closure > 0.5 and fb.state in ("held", "blocked", "empty"):
+            return True
+        if ts >= self.a.grasp_wait:
+            print(f"  hand not settled after {self.a.grasp_wait:.1f} s ({fb if fb is not None else 'no grasp_state'})"
+                  " -> lifting")
+            return True
+        return False
 
     def _touch(self, when):
         """--touch_check: the hand's own view of the grasp (hand_feedback.GraspState, None without touch
@@ -3841,6 +3856,9 @@ def main(argv=None):
                    help="hand with touch sensors (Ability Hand FSRs; sim: the model's touch sensors): act — "
                         "re-grasp / stop when the hand closed on nothing, the robot's success = still held after "
                         "the hold | report — only print it (sim: next to the ground truth) | off")
+    g.add_argument("--grasp_wait", type=float, default=3.0,
+                   help="robot: after closing, lift once the hand's touch check settles (held / blocked / empty), "
+                        "at the latest after this long [s] (simulation: always 1 s)")
     g.add_argument("--grasp_retries", type=int, default=1,
                    help="--touch_check act: the hand closed on nothing -> open and try again this often")
     g.add_argument("--grasp_prompt", default="red ball", help="cgn: text prompt naming the target (Grounded SAM)")

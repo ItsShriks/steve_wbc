@@ -2,14 +2,19 @@
 
 Starts the RealSense driver (aligned depth on, no TF of its own: frames gripper_camera_*) — topics
 /gripper_camera/{color,aligned_depth_to_color}/... with the workspace's realsense2_camera 4.54
-(/gripper_camera/gripper_camera/... with newer drivers) — and, once calibrated, the static TF of its mount
+(/gripper_camera/gripper_camera/... with newer drivers) — and the static TF of its mount
 
-    ur5etool0 -> gripper_camera_color_optical_frame      (config/gripper_camera.yaml)
+    ur5etool0 -> gripper_camera_color_optical_frame
 
-from gripper_camera_calibrator. Without that file only the driver runs (for target_calibrator and
-the calibration itself). The rest of the TF tree (odom -> ... -> ur5etool0) comes from the robot.
+per `mount` (steve_wbc.camera_mount): its calibration from gripper_camera_calibrator
+(config/gripper_camera_ability_hand.yaml | config/gripper_camera.yaml for camera_only), else — not calibrated
+yet — the mount's design pose from its steve_grasping tool config (ability_hand: the D415 on the wrist collar
+beside the palm). Without either only the driver runs (for target_calibrator and the calibration itself).
+The rest of the TF tree (odom -> ... -> ur5etool0) comes from the robot.
 
-    ros2 launch steve_wbc gripper_camera.launch.py                      # first camera found
+    ros2 launch steve_wbc gripper_camera.launch.py                      # first camera found, mount ability_hand
+    ros2 launch steve_wbc gripper_camera.launch.py mount:=camera_only   # the D415 on its post (old setup)
+    ros2 launch steve_wbc gripper_camera.launch.py mount_tf:=false      # driver only (e.g. while calibrating)
     ros2 launch steve_wbc gripper_camera.launch.py serial_no:=_909522061251 profile:=640x480x15   # USB 2
     ros2 launch steve_wbc gripper_camera.launch.py initial_reset:=true    # USB control transfers time out
 """
@@ -25,15 +30,16 @@ from launch.launch_description_sources import PythonLaunchDescriptionSource
 from launch.substitutions import LaunchConfiguration
 from launch_ros.actions import Node
 
+from steve_wbc.camera_mount import DEFAULT_MOUNT, MOUNTS, calibration_files, nominal
+
 NAME = "gripper_camera"
 
 
-def calibration_file():
-    """config/gripper_camera.yaml in the package SOURCE folder (where the calibrator writes it, as
-    table models), else the installed share folder."""
+def calibration_file(mount):
+    """The mount's calibration in the package SOURCE folder (where the calibrator writes it, as table
+    models), else the installed share folder, else None."""
     ws = Path(get_package_prefix("steve_wbc")).parent.parent
-    for c in (ws / "src" / "steve_wbc" / "config" / f"{NAME}.yaml",
-              Path(get_package_share_directory("steve_wbc")) / "config" / f"{NAME}.yaml"):
+    for c in calibration_files(mount, ws / "src" / "steve_wbc", get_package_share_directory("steve_wbc")):
         if c.is_file():
             return c
     return None
@@ -54,16 +60,28 @@ def _setup(context):
             "rgb_camera.color_profile": profile, "depth_module.depth_profile": profile,
             "initial_reset": LaunchConfiguration("initial_reset").perform(context), "wait_for_device_timeout": "10.0",
         }.items())]
-    f = calibration_file()
-    if f is None:
-        print(f"[gripper_camera] no {NAME}.yaml yet: camera only, no mount TF "
-              "(run gripper_camera_calibrator)")
+    mount = LaunchConfiguration("mount").perform(context)
+    if mount not in MOUNTS:
+        raise RuntimeError(f"mount must be one of {MOUNTS}, got '{mount}'")
+    if LaunchConfiguration("mount_tf").perform(context).lower() == "false":
+        print("[gripper_camera] mount_tf:=false: camera only, no mount TF")
         return actions
-    c = yaml.safe_load(f.read_text())
+    f = calibration_file(mount)
+    if f is not None:
+        c = yaml.safe_load(f.read_text())
+        print(f"[gripper_camera] mount {mount}: TF {c['parent']} -> {c['child']} from {f} "
+              f"(calibrated {c.get('time', '?')}, residual {c.get('rms_cm', '?')} cm)")
+    else:
+        c = nominal(mount)
+        if c is None:
+            print(f"[gripper_camera] mount {mount}: not calibrated and no design pose: camera only, no mount TF "
+                  f"(run gripper_camera_calibrator --mount {mount})")
+            return actions
+        print(f"\033[1;33m[gripper_camera] mount {mount}: NOT CALIBRATED — TF {c['parent']} -> {c['child']} from the "
+              f"mount's design pose (steve_grasping config/tools/{mount}.yaml camera:) xyz {c['xyz']}; object positions "
+              f"can be off by a few cm. Calibrate: ros2 run steve_wbc gripper_camera_calibrator --mount {mount}\033[0m")
     x, y, z = c["xyz"]
     qx, qy, qz, qw = c["quat_xyzw"]
-    print(f"[gripper_camera] mount TF {c['parent']} -> {c['child']} from {f} "
-          f"(calibrated {c.get('time', '?')}, residual {c.get('rms_cm', '?')} cm)")
     actions.append(Node(package="tf2_ros", executable="static_transform_publisher", name=f"{NAME}_mount_tf",
                         arguments=["--x", str(x), "--y", str(y), "--z", str(z), "--qx", str(qx), "--qy", str(qy),
                                    "--qz", str(qz), "--qw", str(qw), "--frame-id", c["parent"],
@@ -73,6 +91,11 @@ def _setup(context):
 
 def generate_launch_description():
     return LaunchDescription([
+        DeclareLaunchArgument("mount", default_value=DEFAULT_MOUNT,
+                              description=f"where the camera is: {' | '.join(MOUNTS)} (calibration file / design pose "
+                                          "of its mount TF, steve_wbc.camera_mount)"),
+        DeclareLaunchArgument("mount_tf", default_value="true",
+                              description="false: driver only, no mount TF"),
         DeclareLaunchArgument("serial_no", default_value="''",
                               description="RealSense serial ('' = first found; prefix '_' for numeric serials)"),
         DeclareLaunchArgument("profile", default_value="848x480x30",

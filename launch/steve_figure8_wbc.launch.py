@@ -104,7 +104,7 @@ def launch_setup(context: LaunchContext):
     # --- 2. WHOLE-BODY CONTROLLER ----------------------------------------------
     args = [
         # what is on the flange (steve_grasping): the end effector `pinch` and the collision model
-        "--tool", cfg("tool") or ("camera_only" if env == "real" else "robotiq_2f85"),
+        "--tool", cfg("tool") or ("ability_hand" if env == "real" else "robotiq_2f85"),
         "--amplitude", cfg("amplitude"),
         "--frequency", cfg("frequency"),
         "--loops", cfg("loops"),
@@ -183,8 +183,10 @@ def generate_launch_description():
                               description="RViz with the Gazebo simulation"),
         DeclareLaunchArgument("arm_type", default_value="ur5e", description="UR arm type"),
         DeclareLaunchArgument("tool", default_value="",
-                              description="camera_only | robotiq_2f85 | dex5 (default: camera_only on the robot, "
-                                          "robotiq_2f85 in simulation; same EE point 14.9 cm beyond the flange for both)"),
+                              description="camera_only | robotiq_2f85 | dex5 | ability_hand (default: ability_hand on the "
+                                          "robot, robotiq_2f85 in simulation). The EE is the tool's grasp point: 14.9 cm "
+                                          "beyond the flange for camera_only / robotiq_2f85, the wrap's object centre "
+                                          "(11 cm out, 5.5 cm off the palm) for ability_hand"),
         DeclareLaunchArgument("enable_camera", default_value="false",
                               description="Real robot: start the L515 camera"),
         DeclareLaunchArgument("enable_joystick", default_value="true",

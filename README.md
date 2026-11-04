@@ -224,13 +224,25 @@ FASTRTPS_DEFAULT_PROFILES_FILE=~/.ros/fastdds_steve.xml` — the PC profile must
 
 | Step | Command (PC) | Result |
 |---|---|---|
-| Camera | `ros2 launch steve_wbc gripper_camera.launch.py` | `/gripper_camera/{color,aligned_depth_to_color}/...` (848x480 @ 30, D415 min. range ~0.31 m), + mount TF once calibrated |
+| Camera | `ros2 launch steve_wbc gripper_camera.launch.py` (`mount:=ability_hand` default, `camera_only`: the D415 on its post) | `/gripper_camera/{color,aligned_depth_to_color}/...` (848x480 @ 30, D415 min. range ~0.31 m), + the mount TF: its calibration, else (not calibrated, yellow warning) the mount's design pose from the steve_grasping tool config |
 | Ball profile (once) | `ros2 run steve_wbc target_calibrator --name my_ball --size 0.065 --topic /gripper_camera/color/image_raw` | `config/targets/my_ball.yaml` |
-| Camera mount (once per mounting) | `ros2 run steve_wbc gripper_camera_calibrator --target my_ball`; ball on the table, base still, 8 arm poses (`manipulator --direct joints ...`), Enter at each, `s` | `config/gripper_camera.yaml`: `ur5etool0` → `gripper_camera_color_optical_frame` |
+| Camera mount (once per mounting) | `ros2 run steve_wbc gripper_camera_calibrator --target my_ball --mount ability_hand`; ball on the table, base still, 8 arm poses (`manipulator --direct joints ...`), Enter at each, `s` | `config/gripper_camera_ability_hand.yaml` (`--mount camera_only`: `config/gripper_camera.yaml`): `ur5etool0` → `gripper_camera_color_optical_frame` |
 | Table (after every bringup restart: `odom` resets) | robot 0.3–1.5 m in front of the table: `ros2 run steve_wbc table_probe --name lab_table --lidar_only --top_z 0.827` | `config/tables/lab_table.yaml` (odom); the saved 5-leg shape is the template, only the pose is re-measured: any 3 visible legs suffice (a leg hidden behind another one is fine); `--no_template` measures the shape again (all 4 corners in view) |
 | Detector check | `ros2 run steve_wbc red_ball_detector --ros-args -p target:=my_ball -p topic_style:=realsense -p "cameras:=[gripper_camera]" -p "head_topic:=''"` | `/steve_perception/target_point` (odom) |
 | Dry run (robot does not move) | `ros2 launch steve_wbc active_perception_wbc.launch.py use_sim_time:=false launch_bringup:=false dry_run:=true table:=lab_table target:=my_ball detector_cameras:=gripper_camera vgn:=false goto_grasp_only:=true extra_args:="--camera_tilt 25"` | `... → AT_GRASP → RETREAT → DONE`, `reached grasp pose` |
 | Real run (robot ~1 m back, arm `home`) | the same without `dry_run:=true`, `extra_args:="--camera_tilt 25 --max_base_v 0.10 --max_arm_vel 0.3 --grasp_dz 0.05 --state_timeout 0.5"` (`--state_timeout 0.5`: Wi-Fi) | drives up, finds the ball, hovers 5 cm above the grasp pose, backs up |
+
+**With the Ability Hand** (default `tool` on the robot since 2026-11-04; D415 on the wrist collar beside the palm,
+no `--camera_tilt`): the hand's USB cable is on the robot, so start it there (`ros2 launch steve_grasping
+ability_hand.launch.py`); `launch_hand:=auto` starts it from this launch only where the hand's port exists. On the
+robot the WBC lifts once the hand's touch check has settled (held / blocked / empty), at most `--grasp_wait` 3 s after
+the close. Static red ball:
+
+```bash
+ros2 launch steve_wbc active_perception_wbc.launch.py use_sim_time:=false launch_bringup:=false \
+    table:=lab_table target:=my_ball vgn:=false \
+    extra_args:="--max_base_v 0.10 --max_arm_vel 0.3 --state_timeout 0.5 --hold_time 1"
+```
 
 Then `vgn:=true` (VGN views from the gripper camera, levelled on the table plane; no grasp → other
 sides, see above) and a slowly rolling ball. Without a gripper keep `--grasp_dz` ≥ 0.05: at the true

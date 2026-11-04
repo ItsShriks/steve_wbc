@@ -91,8 +91,9 @@ def launch_setup(context: LaunchContext):
     if simulator not in ("gazebo", "mujoco"):
         raise RuntimeError(f"simulator must be 'gazebo' or 'mujoco', got '{simulator}'")
     env = simulator if is_sim else "real"
-    # what is on the flange (steve_grasping): the real robot has only the D415 since 2026-10-14
-    tool = cfg("tool") or ("robotiq_2f85" if is_sim else "camera_only")
+    # what is on the flange (steve_grasping): the real robot has the Ability Hand with the D415 on its wrist collar
+    # beside the palm since 2026-11-04 (the D415 alone on a post 2026-10-14 .. 11-04: tool:=camera_only)
+    tool = cfg("tool") or ("robotiq_2f85" if is_sim else "ability_hand")
     camera_only = tool == "camera_only"
     # the real robot's only camera is the D415 on the flange — also with a hand there (ability_hand)
     flange_cam = camera_only or env == "real"
@@ -139,8 +140,9 @@ def launch_setup(context: LaunchContext):
     d_base = cfg("d_safe_base") or ("0.25" if env == "real" else "")
     if d_base:
         args += ["--d_safe_base", d_base]
-    # camera looking along the flange axis (D415 on the flange): tilt it forward in the drive / scan poses
-    tilt = cfg("camera_tilt") or ("25" if flange_cam else "0")
+    # camera looking along the flange axis (D415 on its post): tilt it forward in the drive / scan poses. The
+    # Ability Hand's collar already tilts the D415 40 deg outwards: none, as in the simulation
+    tilt = cfg("camera_tilt") or ("25" if camera_only else "0")
     if float(tilt):
         args += ["--camera_tilt", tilt]
     if cfg("log"):
@@ -213,7 +215,17 @@ def launch_setup(context: LaunchContext):
         servers += ["gsam"] if detector == "gsam" or (backend == "cgn" and cfg("vgn").lower() == "true") else []
         servers += ["cgn"] if backend == "cgn" and cfg("vgn").lower() == "true" else []
         servers += ["dgn2"] if backend == "dgn2" and cfg("vgn").lower() == "true" else []
-    if env == "real" and tool == "ability_hand" and cfg("launch_hand").lower() == "true":
+    launch_hand = cfg("launch_hand").lower()
+    if env == "real" and tool == "ability_hand" and launch_hand == "auto":
+        # only where the hand's cable is plugged in: a second bridge elsewhere would offer the same gripper action
+        from steve_grasping.tools import HAND_PORT
+        port = cfg("hand_port") or HAND_PORT
+        launch_hand = "true" if cfg("hand_simulated").lower() == "true" or os.path.exists(port) else "false"
+        print(f"[INFO] active_perception_wbc: Ability Hand {port} "
+              + ("on this machine: starting smart_hand_node + ability_hand_gripper" if launch_hand == "true" else
+                 "not on this machine: using the hand running elsewhere (robot: ros2 launch steve_grasping "
+                 "ability_hand.launch.py)"))
+    if env == "real" and tool == "ability_hand" and launch_hand == "true":
         # the Ability Hand: taco_bandit's smart_hand_node (serial) + the GripperCommand bridge the WBC closes / opens it through
         actions.append(IncludeLaunchDescription(
             PythonLaunchDescriptionSource(os.path.join(get_package_share_directory("steve_grasping"), "launch",
@@ -318,9 +330,10 @@ def generate_launch_description():
         DeclareLaunchArgument("detector_cameras", default_value="",
                               description="robot/Gazebo: cameras of the target detector (default: gripper_camera "
                                           "with tool camera_only, else pan_tilt_camera,wrist_camera)"),
-        DeclareLaunchArgument("launch_hand", default_value="true",
+        DeclareLaunchArgument("launch_hand", default_value="auto",
                               description="robot with tool:=ability_hand: start smart_hand_node + the GripperCommand bridge "
-                                          "(steve_grasping ability_hand.launch.py); false: running elsewhere"),
+                                          "(steve_grasping ability_hand.launch.py) | auto: only if the hand's serial port "
+                                          "is on this machine | false: running elsewhere (e.g. on the robot)"),
         DeclareLaunchArgument("hand_port", default_value="",
                               description="Ability Hand serial port (empty: the hand's FTDI cable, ability_hand.launch.py HAND_PORT)"),
         DeclareLaunchArgument("hand_simulated", default_value="false",
@@ -333,7 +346,7 @@ def generate_launch_description():
                                           "D415 of tool camera_only on the robot, else off)"),
         DeclareLaunchArgument("tool", default_value="",
                               description="what is on the flange (steve_grasping): camera_only | robotiq_2f85 | dex5 | ability_hand "
-                                          "(default: camera_only on the robot, robotiq_2f85 in simulation); "
+                                          "(default: ability_hand on the robot, robotiq_2f85 in simulation); "
                                           "camera_only = go to the grasp pose only"),
         DeclareLaunchArgument("d_safe_base", default_value="",
                               description="min. distance base footprint <-> table legs / environment [m] (default: "

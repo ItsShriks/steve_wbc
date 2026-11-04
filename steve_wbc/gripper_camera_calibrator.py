@@ -4,8 +4,9 @@ gripper_camera_calibrator.py
 ============================
 Where is the camera on the gripper? Eye-in-hand calibration of the gripper camera's mount
 (ur5etool0 -> gripper_camera_color_optical_frame) with the target ball lying on the table — no
-marker needed. The result goes to config/gripper_camera.yaml, which gripper_camera.launch.py
-publishes as a static TF.
+marker needed. The result goes to the mount's file (steve_wbc.camera_mount, --mount: ability_hand ->
+config/gripper_camera_ability_hand.yaml, camera_only -> config/gripper_camera.yaml), which
+gripper_camera.launch.py publishes as a static TF.
 
 Put the ball (target profile, e.g. my_ball) on the table, keep the BASE still, then move the ARM
 to 6-10 poses that see the ball from different directions: tilt the camera, turn wrist 3 by
@@ -13,7 +14,7 @@ to 6-10 poses that see the ball from different directions: tilt the camera, turn
 the ball is in the image. At every pose, with the arm still, press Enter.
 
     ros2 launch steve_wbc gripper_camera.launch.py                       # terminal 1
-    ros2 run steve_wbc gripper_camera_calibrator --target my_ball        # terminal 2
+    ros2 run steve_wbc gripper_camera_calibrator --target my_ball        # terminal 2 (--mount ability_hand)
     ros2 run steve_wbc gripper_camera_calibrator --load ~/ros_logs/gripper_camera_calib/<t>/captures.json
 
 Per capture (median of --frames depth frames): the ball centre in the camera frame (sphere fit
@@ -21,7 +22,7 @@ with the profile's radius to its depth points), the table plane (RANSAC on the o
 base_link <- ur5etool0 from the robot's TF (arm still: two lookups 0.4 s apart must agree).
 Unknowns: the mount (6), the ball position (3), the table height (1). Residuals: the ball must
 stay put, the table must be level and at one height, the ball lies on it (radius above).
-Several starts (camera looking along +-tool z, turned 0/90/180/270 deg); reported: per-capture
+Several starts (the mount's design pose, camera looking along +-tool z turned 0/90/180/270 deg); reported: per-capture
 ball residuals, the RMS, and the 1-sigma uncertainty of the mount.
 
 Keys: Enter = capture   u = undo last   s = solve + save   q = quit
@@ -38,9 +39,11 @@ from scipy.optimize import least_squares
 from scipy.spatial.transform import Rotation
 
 try:
+    from steve_wbc.camera_mount import DEFAULT_MOUNT, MOUNTS, calibration_name, nominal
     from steve_wbc.target_profile import TargetProfile
     from steve_wbc.table_model import tables_dir
 except ImportError:
+    from camera_mount import DEFAULT_MOUNT, MOUNTS, calibration_name, nominal
     from target_profile import TargetProfile
     from table_model import tables_dir
 
@@ -147,21 +150,25 @@ def residuals(x, caps, r, top_z=None):
     return np.array(out)
 
 
-def solve(caps, r, top_z=None):
-    """Best of several starts. Returns dict with X (4x4), ball, height, per-capture errors, sigma."""
-    best = None
+def solve(caps, r, top_z=None, prior=None):
+    """Best of several starts (prior: the mount's design pose, dict xyz + quat_xyzw, tried first). Returns
+    dict with X (4x4), ball, height, per-capture errors, sigma."""
+    starts = []
+    if prior is not None:
+        starts.append((Rotation.from_quat(prior["quat_xyzw"]), np.asarray(prior["xyz"], float)))
     for flip in (False, True):
         for k in range(4):
             R0 = Rotation.from_euler("z", k * np.pi / 2)
-            if flip:
-                R0 = Rotation.from_euler("x", np.pi) * R0
-            Rx0 = R0.as_matrix()
-            bs = [np.asarray(cp["R"]) @ (Rx0 @ np.asarray(cp["c"])) + np.asarray(cp["p"]) for cp in caps]
-            b0 = np.mean(bs, axis=0)
-            x0 = np.concatenate([R0.as_rotvec(), np.zeros(3), b0, [b0[2] - r]])
-            sol = least_squares(residuals, x0, args=(caps, r, top_z), loss="soft_l1", f_scale=2.0)
-            if best is None or sol.cost < best.cost:
-                best = sol
+            starts.append((Rotation.from_euler("x", np.pi) * R0 if flip else R0, np.zeros(3)))
+    best = None
+    for R0, t0 in starts:
+        Rx0 = R0.as_matrix()
+        bs = [np.asarray(cp["R"]) @ (Rx0 @ np.asarray(cp["c"]) + t0) + np.asarray(cp["p"]) for cp in caps]
+        b0 = np.mean(bs, axis=0)
+        x0 = np.concatenate([R0.as_rotvec(), t0, b0, [b0[2] - r]])
+        sol = least_squares(residuals, x0, args=(caps, r, top_z), loss="soft_l1", f_scale=2.0)
+        if best is None or sol.cost < best.cost:
+            best = sol
     Rx, tx, b, h = _unpack(best.x)
     if top_z is not None:
         h = top_z
@@ -212,7 +219,7 @@ def save(s, caps, out, target):
     out.parent.mkdir(parents=True, exist_ok=True)
     out.write_text("# Gripper camera mount — written by gripper_camera_calibrator, read by gripper_camera.launch.py\n"
                    + yaml.safe_dump(data, sort_keys=False))
-    print(f"saved {out}\n-> restart `ros2 launch steve_wbc gripper_camera.launch.py` to publish the mount TF")
+    print(f"saved {out}\n-> restart `ros2 launch steve_wbc gripper_camera.launch.py` (its mount) to publish the mount TF")
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -324,15 +331,18 @@ def main(argv=None):
     p.add_argument("--min", type=int, default=6, help="captures needed before saving")
     p.add_argument("--top_z", type=float, default=None, help="table top height in base_link if known [m]")
     p.add_argument("--load", default=None, help="solve saved captures (captures.json) instead of capturing")
-    p.add_argument("--out", default=None, help=f"result (default config/{NAME}.yaml in the steve_wbc source)")
+    p.add_argument("--mount", default=DEFAULT_MOUNT, choices=MOUNTS,
+                   help="where the camera is (steve_wbc.camera_mount): its result file and design pose (first start)")
+    p.add_argument("--out", default=None, help="result (default config/<the mount's file>.yaml in the steve_wbc source)")
     p.add_argument("--timeout", type=float, default=15.0)
     a = p.parse_args(argv)
     target = TargetProfile.load(a.target)
-    out = Path(a.out) if a.out else tables_dir().parent / f"{NAME}.yaml"
+    out = Path(a.out) if a.out else tables_dir().parent / f"{calibration_name(a.mount)}.yaml"
+    prior = nominal(a.mount)
 
     if a.load:
         caps = json.loads(Path(a.load).expanduser().read_text())
-        s = solve(caps, target.radius, a.top_z)
+        s = solve(caps, target.radius, a.top_z, prior)
         report(s, caps)
         if input(f"save to {out}? [y/N] ").strip().lower() == "y":
             save(s, caps, out, target)
@@ -357,7 +367,7 @@ def main(argv=None):
             if len(caps) < a.min:
                 print(f"  need at least {a.min} captures (from different directions)")
                 continue
-            s = solve(caps, target.radius, a.top_z)
+            s = solve(caps, target.radius, a.top_z, prior)
             report(s, caps)
             if s["rms_cm"] > 1.0:
                 print("  [WARN] ball RMS > 1 cm: remove bad captures (u) / add more varied ones")
@@ -374,7 +384,7 @@ def main(argv=None):
         print(f"  #{len(caps)}: ball {np.linalg.norm(v['c']):.2f} m away ({v['n_ball']} points, sphere fit "
               f"{v['sd'] * 1000:.1f} mm), table {v['plane_inliers']} points, tool at {np.round(v['p'], 3)}")
         if len(caps) >= 4:
-            s = solve(caps, target.radius, a.top_z)
+            s = solve(caps, target.radius, a.top_z, prior)
             print(f"  so far: ball RMS {s['rms_cm']:.2f} cm, mount xyz {np.round(s['X'][:3, 3], 3)} m "
                   f"(+-{np.round(s['sig_t_mm'], 0)} mm)")
     print(f"captures saved in {log}/captures.json (re-solve with --load)")
