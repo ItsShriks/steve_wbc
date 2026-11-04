@@ -1,7 +1,7 @@
 """
 sim_realism.py — the real robot's imperfections for the MuJoCo simulation of active_perception_wbc
 (--sim_realism): what the perfect simulation leaves out and the robot (MMO-700 + UR5e over Wi-Fi, D415 on the
-printed wrist collar, Ability Hand over ah_node) does not.
+printed wrist collar, Ability Hand over taco_bandit's smart_hand_node) does not.
 
   component  what                                                         real source
   ─────────  ───────────────────────────────────────────────────────────  ─────────────────────────────────────
@@ -27,7 +27,7 @@ printed wrist collar, Ability Hand over ah_node) does not.
   lidar      S300 range noise and dropouts                                SICK S300 spec (~1-2 cm)
   object     ball: rolling resistance, a slightly tilted table, table      a real ball / table
              unevenness while rolling (not a perfect constant velocity)
-  hand       Ability Hand command latency and finite finger speed          ah_node + serial, hand motors
+  hand       Ability Hand command latency and finite finger speed          smart_hand_node + serial, hand motors
 
 Every random per-run error is drawn from --realism_seed and printed at the start; --realism_scale scales all
 noise / error magnitudes (latencies stay), --realism_off disables single components (to find which one breaks
@@ -101,7 +101,7 @@ class RealismConfig:
     obj_tilt_sd: float = 0.001       # m/s^2 per run, per axis: table tilt (0.001 = 0.006 deg)
     obj_rough_sd: float = 0.003      # m/s^2 table unevenness while rolling (low-pass 0.5 s)
     # hand (Ability Hand)
-    hand_latency: float = 0.10       # s    GripperCommand -> ability_hand_gripper -> ah_node -> serial
+    hand_latency: float = 0.10       # s    GripperCommand -> ability_hand_gripper -> smart_hand_node -> serial
     hand_speed: float = 200.0        # deg/s finger speed (measure on the hand: full close 95 deg in ~0.5 s?)
 
     STOCHASTIC = ("depth_subpixel", "depth_scale_sd", "depth_holes", "depth_edge_drop", "rgb_noise", "rgb_gain_sd",

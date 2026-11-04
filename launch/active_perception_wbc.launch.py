@@ -214,7 +214,7 @@ def launch_setup(context: LaunchContext):
         servers += ["cgn"] if backend == "cgn" and cfg("vgn").lower() == "true" else []
         servers += ["dgn2"] if backend == "dgn2" and cfg("vgn").lower() == "true" else []
     if env == "real" and tool == "ability_hand" and cfg("launch_hand").lower() == "true":
-        # the Ability Hand: ah_node (serial) + the GripperCommand bridge the WBC closes / opens it through
+        # the Ability Hand: taco_bandit's smart_hand_node (serial) + the GripperCommand bridge the WBC closes / opens it through
         actions.append(IncludeLaunchDescription(
             PythonLaunchDescriptionSource(os.path.join(get_package_share_directory("steve_grasping"), "launch",
                                                        "ability_hand.launch.py")),
@@ -319,11 +319,12 @@ def generate_launch_description():
                               description="robot/Gazebo: cameras of the target detector (default: gripper_camera "
                                           "with tool camera_only, else pan_tilt_camera,wrist_camera)"),
         DeclareLaunchArgument("launch_hand", default_value="true",
-                              description="robot with tool:=ability_hand: start ah_node + the GripperCommand bridge "
+                              description="robot with tool:=ability_hand: start smart_hand_node + the GripperCommand bridge "
                                           "(steve_grasping ability_hand.launch.py); false: running elsewhere"),
-        DeclareLaunchArgument("hand_port", default_value="", description="Ability Hand serial port (empty: auto)"),
+        DeclareLaunchArgument("hand_port", default_value="",
+                              description="Ability Hand serial port (empty: the hand's FTDI cable, ability_hand.launch.py HAND_PORT)"),
         DeclareLaunchArgument("hand_simulated", default_value="false",
-                              description="ah_node's virtual hand (no hardware): test the gripper path"),
+                              description="taco_bandit's mock hand (no hardware): test the gripper path"),
         DeclareLaunchArgument("dynamic", default_value="false",
                               description="true: moving objects — camera kept on the object up to the descent, "
                                           "re-acquire, velocity while driving (active_perception_wbc --dynamic)"),
