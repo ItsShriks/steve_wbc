@@ -17,23 +17,29 @@ RECTS = [(np.array([2 - 0.38, 0.0]), I2, np.array([0.02, 0.35])), (np.array([2 +
         [(np.array([2 + x, y]), I2, np.array([0.025, 0.025])) for x in (-0.35, 0.35) for y in (-0.30, 0.30)]
 
 
-def scan(base_true, noise=0.012, drop=0.01, seed=0):
-    """360 rays from the base at the table's outline (true world, slab ray-box intersection), points in the base
-    frame with range noise and dropouts."""
+# the two SICK S300 at the base corners (models/mmo_700_wbc.xml lidar_1_link / lidar_2_link), base frame
+SENSORS = np.array([[0.338, 0.288], [-0.338, -0.288]])
+
+
+def scan(base_true, noise=0.012, drop=0.01, seed=0, sensors=((0.0, 0.0),)):
+    """360 rays from each sensor (base frame; default the base centre) at the table's outline (true world, slab
+    ray-box intersection), points in the base frame with range noise and dropouts."""
     rng = np.random.default_rng(seed)
     pts = []
-    for a in np.radians(np.arange(0, 360, 1.0)):
-        u = np.array([np.cos(a + base_true[2]), np.sin(a + base_true[2])])
-        best = np.inf
-        for c, _, h in RECTS:                            # axis-aligned boxes
-            lo, hi = c - h - base_true[:2], c + h - base_true[:2]
-            with np.errstate(divide="ignore", invalid="ignore"):
-                t1, t2 = lo / u, hi / u
-            tn, tf = np.max(np.minimum(t1, t2)), np.min(np.maximum(t1, t2))
-            if tn <= tf and tn > 0.05:
-                best = min(best, tn)
-        if np.isfinite(best) and rng.random() > drop:
-            pts.append(_rot(-base_true[2]) @ ((best + rng.normal(0, noise)) * u))
+    for s in np.asarray(sensors, float):
+        o = base_true[:2] + _rot(base_true[2]) @ s
+        for a in np.radians(np.arange(0, 360, 1.0)):
+            u = np.array([np.cos(a + base_true[2]), np.sin(a + base_true[2])])
+            best = np.inf
+            for c, _, h in RECTS:                        # axis-aligned boxes
+                lo, hi = c - h - o, c + h - o
+                with np.errstate(divide="ignore", invalid="ignore"):
+                    t1, t2 = lo / u, hi / u
+                tn, tf = np.max(np.minimum(t1, t2)), np.min(np.maximum(t1, t2))
+                if tn <= tf and tn > 0.05:
+                    best = min(best, tn)
+            if np.isfinite(best) and rng.random() > drop:
+                pts.append(s + _rot(-base_true[2]) @ ((best + rng.normal(0, noise)) * u))
     return np.array(pts)
 
 
@@ -93,3 +99,30 @@ def test_one_face_in_view():
     corr = loc.base(odom_of(base, dth, d))
     assert abs(corr[0] - base[0]) < 0.010 and abs(corr[2] - base[2]) < np.radians(0.4)
     assert abs(corr[1] - base[1]) < 0.025                  # at most the original drift, not more
+
+
+def test_base_level_with_a_skirt_face():
+    """The base at the table's right side, its centre level with the front skirt (x 1.66, the skirt 1.60-1.64):
+    seen from the centre that skirt's back face looks visible, but the corner scanners see its front face. With the
+    scanners' positions the correction stays put (2026-11-04: from the centre it slid 4 cm along the side during a
+    grasp, the hand closed 4 cm off the ball)."""
+    base = np.array([1.664, -0.89, np.radians(89.0)])
+    loc = TableLocalizer(RECTS, sensors=SENSORS)
+    for k in range(30):
+        loc.update(0.21 * k, base, scan(base, noise=0.003, seed=k, sensors=SENSORS))
+    assert np.linalg.norm(loc.base(base)[:2] - base[:2]) < 0.005 and abs(loc.theta) < np.radians(0.2)
+    # the old behaviour (visibility from the base centre) on the same scans drifts
+    old = TableLocalizer(RECTS)
+    for k in range(30):
+        old.update(0.21 * k, base, scan(base, noise=0.003, seed=k, sensors=SENSORS))
+    assert np.linalg.norm(old.base(base)[:2] - base[:2]) > 0.02
+
+
+def test_scanners_converge_to_the_drift():
+    base = np.array([1.35, -0.75, 0.6])
+    dth, d = np.radians(1.2), np.array([0.03, -0.02])
+    loc = TableLocalizer(RECTS, sensors=SENSORS)
+    for k in range(60):
+        loc.update(0.21 * k, odom_of(base, dth, d), scan(base, seed=k, sensors=SENSORS))
+    corr = loc.base(odom_of(base, dth, d))
+    assert np.linalg.norm(corr[:2] - base[:2]) < 0.010 and abs(corr[2] - base[2]) < np.radians(0.4)

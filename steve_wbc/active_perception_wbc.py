@@ -1608,7 +1608,10 @@ class ActivePerceptionWBC:
         if not rects:
             print(f"[localize] nothing of the environment model at the LiDAR height ({z:.2f} m): drift not corrected")
             return
-        self.loc = TableLocalizer(rects, z)
+        # the scanners in the base frame: which faces of the outline each scan point can lie on
+        Rb = rot_z(st.base[2])[:2, :2]
+        sensors = [Rb.T @ (d.site_xpos[i][:2] - st.base[:2]) for i in sites if i >= 0] or None
+        self.loc = TableLocalizer(rects, z, sensors)
         self.b = FrameBackend(self.b, self.loc, self.w.lidar_points)
         self.w = FrameWorld(self.w, self.loc)
         print(f"[localize] odometry drift corrected against {len(rects)} outline(s) of the environment model at the "

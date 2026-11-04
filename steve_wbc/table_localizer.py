@@ -18,7 +18,8 @@ per fit, averaged over successive scans), at most MAX_STEP_XY / MAX_STEP_YAW per
 controller), and only after a good fit (MIN_POINTS inliers, RMS < MAX_RMS). Without a fit for STALE s the frame is "not localized" (the
 tracker's drift allowance goes back to odometry-only).
 
-    loc = TableLocalizer(rects, lidar_z)          # rects: [(centre xy, R 2x2, half xy)] in the table frame
+    loc = TableLocalizer(rects, lidar_z, sensors) # rects: [(centre xy, R 2x2, half xy)] in the table frame,
+                                                  # sensors: the scanners' xy in the base frame
     loc.update(t, base_odom, lidar_pts_base)      # every tick; works every PERIOD
     loc.base(base_odom), loc.p(p_odom), loc.R(R_odom), loc.inv_p(p_c)
 """
@@ -43,7 +44,11 @@ class TableLocalizer:
     HUBER = 0.01          # m
     ITERS = 6
 
-    def __init__(self, rects, lidar_z=None):
+    def __init__(self, rects, lidar_z=None, sensors=None):
+        """sensors: the LiDARs' xy in the base frame (M x 2), for which faces a scan point can lie on; None: the
+        base centre (wrong once the base is level with a face: at a table side's end the centre is past the plane
+        of the skirt across it, whose near face the corner scanners see — 2026-11-04, 4 cm slide during a grasp)."""
+        self.sensors = None if sensors is None else np.asarray(sensors, float).reshape(-1, 2)
         self.c = np.array([r[0] for r in rects], float).reshape(-1, 2)
         self.Rr = np.array([r[1] for r in rects], float).reshape(-1, 2, 2)
         self.h = np.array([r[2] for r in rects], float).reshape(-1, 2)
@@ -96,8 +101,8 @@ class TableLocalizer:
     # ── geometry ─────────────────────────────────────────────────────────────────
     def closest(self, P, sensor=None):
         """For points P (N x 2): (closest boundary point, outward normal there, distance) over all shapes — with
-        `sensor` (xy) only on faces it can see (a noisy point inside a 4 cm skirt board must not snap to the board's
-        back face: that biased the heading by 0.2-0.5 deg)."""
+        `sensor` (xy, or M x 2: any of them) only on faces it can see (a noisy point inside a 4 cm skirt board must
+        not snap to the board's back face: that biased the heading by 0.2-0.5 deg)."""
         q = np.einsum("nkj,kji->nki", P[:, None, :] - self.c[None], self.Rr)    # local coords (N, K, 2)
         h = self.h[None]
         N_, K = q.shape[:2]
@@ -118,9 +123,11 @@ class TableLocalizer:
                 n[..., a] = sg
                 faces.append((b, n, h[..., a] - sg * q[..., a]))
         if sensor is not None:
-            sl = np.einsum("kj,kji->ki", np.asarray(sensor, float)[None, :] - self.c, self.Rr)[None]   # (1, K, 2)
-            d_cl = np.where(np.einsum("nki,nki->nk", n_cl, sl - cl) > 0, d_cl, np.inf)
-            faces = [(b, n, np.where(np.einsum("nki,nki->nk", n, sl - b) > 0, d, np.inf)) for b, n, d in faces]
+            S = np.asarray(sensor, float).reshape(-1, 2)
+            sl = np.einsum("skj,kji->ski", S[:, None, :] - self.c[None], self.Rr)[:, None]   # (M, 1, K, 2)
+            seen = lambda n, b: np.any(np.einsum("nki,snki->snk", n, sl - b[None]) > 0, axis=0)   # by any sensor
+            d_cl = np.where(seen(n_cl, cl), d_cl, np.inf)
+            faces = [(b, n, np.where(seen(n, b), d, np.inf)) for b, n, d in faces]
         fd = np.stack([f[2] for f in faces], -1)                                # (N, K, 4)
         fi = np.argmin(fd, -1)
         fb = np.stack([f[0] for f in faces], -2)                                # (N, K, 4, 2)
@@ -155,7 +162,8 @@ class TableLocalizer:
         for _ in range(self.ITERS):
             W = Q @ _rot(th).T + t
             pivot = _rot(th) @ b[:2] + t                                      # the base, corrected
-            B, N, d = self.closest(W, pivot)
+            sens = pivot if self.sensors is None else (self.sensors @ _rot(b[2]).T + b[:2]) @ _rot(th).T + t
+            B, N, d = self.closest(W, sens)
             m = d < self.MAX_DIST
             inl = int(m.sum())
             if inl < self.MIN_POINTS:
