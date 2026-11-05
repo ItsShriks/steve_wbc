@@ -141,9 +141,10 @@ def launch_setup(context: LaunchContext):
     d_base = cfg("d_safe_base") or ("0.25" if env == "real" else "")
     if d_base:
         args += ["--d_safe_base", d_base]
-    # camera looking along the flange axis (D415 on its post): tilt it forward in the drive / scan poses. The
-    # Ability Hand's collar already tilts the D415 40 deg outwards: none, as in the simulation
-    tilt = cfg("camera_tilt") or ("25" if camera_only else "0")
+    # camera looking along the flange axis (the D415 on its post; the D435i at the Ability Hand's palm side since
+    # 2026-11-05): tilt it forward in the drive / scan poses. Untilted the sim with --sim_realism saw the ball at a
+    # grazing angle over the table's front edge and accepted a detection 47 cm off; tilted 25 deg it succeeded
+    tilt = cfg("camera_tilt") or ("25" if flange_cam else "0")
     if float(tilt):
         args += ["--camera_tilt", tilt]
     if cfg("log"):
