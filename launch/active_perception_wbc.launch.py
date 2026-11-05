@@ -132,7 +132,8 @@ def launch_setup(context: LaunchContext):
     if cfg("dynamic").lower() == "true":  # moving objects (rolling ball); off: the static behaviour
         args.append("--dynamic")
     # wrist-camera detections closer than the depth range are wrong (the D415 on the real flange: ~0.3 m)
-    min_rng = cfg("min_detect_range") or ("0.30" if env == "real" and flange_cam else "")
+    # (a tool with its own camera, e.g. ability_hand's D435i: its config's min_range)
+    min_rng = cfg("min_detect_range") or ("0.30" if env == "real" and camera_only else "")
     if min_rng:
         args += ["--min_detect_range", min_rng]
     # base <-> table legs: the real robot needs more than the 15 cm of the model — the scanners' protective
