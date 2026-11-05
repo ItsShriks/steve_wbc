@@ -84,6 +84,25 @@ def warn_wifi_link():
               "(192.168.60.90) nor Wi-Fi address — is the robot reachable?")
 
 
+def _port_in_use(port):
+    """Some process here has the serial port open (e.g. a running ability_hand.launch.py): do not start a second
+    driver on it (2026-11-05: the second one could not connect, its bridge offered the same gripper action)."""
+    try:
+        dev = os.path.realpath(port)
+        for pid in os.listdir("/proc"):
+            if not pid.isdigit():
+                continue
+            try:
+                for fd in os.listdir(f"/proc/{pid}/fd"):
+                    if os.path.realpath(f"/proc/{pid}/fd/{fd}") == dev:
+                        return True
+            except OSError:
+                continue
+    except OSError:
+        pass
+    return False
+
+
 def launch_setup(context: LaunchContext):
     cfg = lambda name: LaunchConfiguration(name).perform(context)
     is_sim = cfg("use_sim_time").lower() == "true"
@@ -222,17 +241,22 @@ def launch_setup(context: LaunchContext):
         # only where the hand's cable is plugged in: a second bridge elsewhere would offer the same gripper action
         from steve_grasping.tools import HAND_PORT
         port = cfg("hand_port") or HAND_PORT
-        launch_hand = "true" if cfg("hand_simulated").lower() == "true" or os.path.exists(port) else "false"
+        here, busy = os.path.exists(port), _port_in_use(port)
+        launch_hand = "true" if cfg("hand_simulated").lower() == "true" or (here and not busy) else "false"
         print(f"[INFO] active_perception_wbc: Ability Hand {port} "
               + ("on this machine: starting smart_hand_node + ability_hand_gripper" if launch_hand == "true" else
+                 "already open on this machine (ability_hand.launch.py running): using it" if busy else
                  "not on this machine: using the hand running elsewhere (robot: ros2 launch steve_grasping "
                  "ability_hand.launch.py)"))
     if env == "real" and tool == "ability_hand" and launch_hand == "true":
-        # the Ability Hand: taco_bandit's smart_hand_node (serial) + the GripperCommand bridge the WBC closes / opens it through
+        # the Ability Hand: taco_bandit's smart_hand_node (serial) + the GripperCommand bridge the WBC closes / opens it
+        # through. tool passed on: an included launch file sees this file's (empty) `tool` argument, and the bridge then
+        # loaded the default tool robotiq_2f85 (2026-11-05)
         actions.append(IncludeLaunchDescription(
             PythonLaunchDescriptionSource(os.path.join(get_package_share_directory("steve_grasping"), "launch",
                                                        "ability_hand.launch.py")),
-            launch_arguments={"port": cfg("hand_port"), "simulated_hand": cfg("hand_simulated")}.items()))
+            launch_arguments={"port": cfg("hand_port"), "simulated_hand": cfg("hand_simulated"),
+                              "tool": tool}.items()))
     for m in servers:
         actions.append(Node(package="steve_perception", executable="model_server", name=f"model_server_{m}",
                             arguments=[m], output="screen", emulate_tty=True))

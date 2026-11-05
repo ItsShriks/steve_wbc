@@ -1,0 +1,28 @@
+# Gripper camera mount — written by gripper_camera_calibrator, read by gripper_camera.launch.py
+parent: ur5etool0
+child: gripper_camera_color_optical_frame
+xyz:
+- -0.04504
+- 0.04781
+- 0.03224
+quat_xyzw:
+- -0.168719
+- 0.014333
+- -0.004644
+- 0.985549
+rpy_deg:
+- -19.44
+- 1.53
+- -0.8
+rms_cm: 0.36
+captures: 7
+target: my_ball
+sigma_xyz_mm:
+- 13.8
+- 14.6
+- 14.2
+sigma_rpy_deg:
+- 1.28
+- 1.97
+- 2.1
+time: 2026-11-05 14:47
